@@ -1,6 +1,17 @@
 #include "uc_snapshot.h"
 #include "state_snapshotting.h"
 #include <string.h>
+#include <stdlib.h>
+
+/* Compatibility function for uc_mem_set (not available in Unicorn 2.x) */
+static uc_err uc_mem_set(uc_engine *uc, uint64_t addr, uint8_t value, size_t size) {
+    uint8_t *buf = (uint8_t *)malloc(size);
+    if (!buf) return UC_ERR_NOMEM;
+    memset(buf, value, size);
+    uc_err err = uc_mem_write(uc, addr, buf, size);
+    free(buf);
+    return err;
+}
 
 /*
  * Snapshotting of the unicorn engine state (registers and memory).

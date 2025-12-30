@@ -188,7 +188,7 @@ uc_err init_tracing(uc_engine *uc, char *p_bbl_set_trace_path, char *p_bbl_hash_
             trace_state.kh_scratch_basic_block_set = kh_init(32);
 
             // Tracing basic blocks is done via a single block hook
-            uc_hook_add(uc, &tmp_hook, UC_HOOK_BLOCK_UNCONDITIONAL, hook_block_trace_set, NULL, 1, 0);
+            uc_hook_add(uc, &tmp_hook, UC_HOOK_BLOCK, hook_block_trace_set, NULL, 1, 0);
         }
 
         if(p_bbl_hash_path) {
@@ -197,7 +197,7 @@ uc_err init_tracing(uc_engine *uc, char *p_bbl_set_trace_path, char *p_bbl_hash_
             printf("logging basic block hash to %s\n", bbl_hash_path);
 
             // Tracing basic blocks is done via a single block hook
-            uc_hook_add(uc, &tmp_hook, UC_HOOK_BLOCK_UNCONDITIONAL, hook_block_trace_hash_bbs, NULL, 1, 0);
+            uc_hook_add(uc, &tmp_hook, UC_HOOK_BLOCK, hook_block_trace_hash_bbs, NULL, 1, 0);
         }
 
         if(p_mmio_set_trace_path) {

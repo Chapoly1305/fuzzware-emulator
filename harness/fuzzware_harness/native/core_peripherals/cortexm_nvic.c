@@ -1,4 +1,5 @@
 #include "cortexm_nvic.h"
+#include "../unicorn2_compat.h"
 
 // We implement recalculating states lazily, but can disable that behavior
 // #define DISABLE_LAZY_RECALCS
@@ -57,28 +58,38 @@ struct CortexmNVIC nvic __attribute__ ((aligned (64))) = {
     .prev_basepri = -1
 };
 
+// Cached uc_engine pointer for Unicorn 2.x compatibility
+static uc_engine *nvic_uc = NULL;
+
 /*
  * Access wrappers for interrupt-related registers
+ * Updated for Unicorn 2.x: use uc_reg_read instead of direct pointer access
  */
 static inline uint8_t GET_PRIMASK() {
-    return *nvic.reg_daif_ptr & CPSR_IRQ_MASK_BIT;
+    uint32_t primask = 0;
+    uc_reg_read(nvic_uc, UC_ARM_REG_PRIMASK, &primask);
+    return primask & CPSR_IRQ_MASK_BIT;
 }
 
 static inline int32_t GET_BASEPRI() {
-    return *nvic.reg_basepri_ptr;
+    uint32_t basepri = 0;
+    uc_reg_read(nvic_uc, UC_ARM_REG_BASEPRI, &basepri);
+    return basepri;
 }
 
 // Versions of the above that assume an existing NVIC pointer
 static inline uint8_t GET_PRIMASK_NVIC(struct CortexmNVIC *p_nvic) {
-    return *p_nvic->reg_daif_ptr & CPSR_IRQ_MASK_BIT;
+    (void)p_nvic; // unused in Unicorn 2.x
+    return GET_PRIMASK();
 }
 
 static inline int32_t GET_BASEPRI_NVIC(struct CortexmNVIC *p_nvic) {
-    return *p_nvic->reg_basepri_ptr;
+    (void)p_nvic; // unused in Unicorn 2.x
+    return GET_BASEPRI();
 }
 
 static inline uint32_t GET_CURR_SP_MODE_IS_PSP () {
-    return *reg_curr_sp_mode_is_psp_ptr;
+    return uc_get_curr_sp_mode_is_psp(nvic_uc);
 }
 
 #define is_exception_ret(pc) ((pc & EXCEPT_MAGIC_RET_MASK) == EXCEPT_MAGIC_RET_MASK)
@@ -890,10 +901,10 @@ void ExceptionReturn(uc_engine *uc, uint32_t ret_pc) {
     #ifdef DEBUG_NVIC
     uint32_t sp_mode, other_sp, sp, lr;
     sp_mode = GET_CURR_SP_MODE_IS_PSP();
-    uc_reg_read(uc, UC_ARM_REG_OTHER_SP, &other_sp);
+    uc_get_other_sp(uc, &other_sp);
     uc_reg_read(uc, UC_ARM_REG_SP, &sp);
     uc_reg_read(uc, UC_ARM_REG_LR, &lr);
-    printf("[ExceptionReturn] UC_ARM_REG_CURR_SP_MODE_IS_PSP=%d, UC_ARM_REG_OTHER_SP=%08x, UC_ARM_REG_SP=%08x, lr=%08x\n", sp_mode, other_sp, sp, lr); fflush(stdout);
+    printf("[ExceptionReturn] CURR_SP_MODE_IS_PSP=%d, other_sp=%08x, sp=%08x, lr=%08x\n", sp_mode, other_sp, sp, lr); fflush(stdout);
     #endif
 
     /* 
@@ -918,20 +929,16 @@ void ExceptionReturn(uc_engine *uc, uint32_t ret_pc) {
         if(ret_pc & NVIC_INTERRUPT_ENTRY_LR_PSPSWITCH_FLAG) {
             // We are coming from Handler Mode (which always uses SP_main) and
             // return to Thread Mode which uses SP_process. Switch to SP_process
-            uint32_t new_SPSEL_now_psp = 1;
             uint32_t SP_process, SP_main;
             uc_reg_read(uc, UC_ARM_REG_SP, &SP_main);
-            uc_reg_read(uc, UC_ARM_REG_OTHER_SP, &SP_process);
+            uc_get_other_sp(uc, &SP_process);
 
-            // Back up SP_main
-            uc_reg_write(uc, UC_ARM_REG_OTHER_SP, &SP_main);
+            // Back up SP_main to MSP, switch SP to PSP value
+            uc_reg_write(uc, UC_ARM_REG_MSP, &SP_main);
             uc_reg_write(uc, UC_ARM_REG_SP, &SP_process);
 
-            // Switch the CPU state to indicate the new SPSEL state
-            // 1. In pstate register
-            uc_reg_write(uc, UC_ARM_REG_SPSEL, &new_SPSEL_now_psp);
-            // 2. In cached spsel field
-            uc_reg_write(uc, UC_ARM_REG_CURR_SP_MODE_IS_PSP, &new_SPSEL_now_psp);
+            // Switch the CPU state to indicate the new SPSEL state (use PSP)
+            uc_set_spsel(uc, 1);
         }
     }
 
@@ -1037,20 +1044,16 @@ static void ExceptionEntry(uc_engine *uc, bool is_tail_chained, bool skip_instru
 
             if(GET_CURR_SP_MODE_IS_PSP()) {
                 // We are coming from Thread Mode which uses SP_process. Switch it to SP_main
-                uint32_t new_SPSEL_not_psp = 0;
                 uint32_t SP_process, SP_main;
                 uc_reg_read(uc, UC_ARM_REG_SP, &SP_process);
-                uc_reg_read(uc, UC_ARM_REG_OTHER_SP, &SP_main);
+                uc_get_other_sp(uc, &SP_main);
 
-                // Back up SP_process
-                uc_reg_write(uc, UC_ARM_REG_OTHER_SP, &SP_process);
+                // Back up SP_process to PSP, switch SP to MSP value
+                uc_reg_write(uc, UC_ARM_REG_PSP, &SP_process);
                 uc_reg_write(uc, UC_ARM_REG_SP, &SP_main);
 
-                // Switch the CPU state to indicate the new SPSEL state
-                // 1. In pstate register
-                uc_reg_write(uc, UC_ARM_REG_SPSEL, &new_SPSEL_not_psp);
-                // 2. In cached spsel field
-                uc_reg_write(uc, UC_ARM_REG_CURR_SP_MODE_IS_PSP, &new_SPSEL_not_psp);
+                // Switch the CPU state to indicate the new SPSEL state (use MSP)
+                uc_set_spsel(uc, 0);
 
                 // Finally: Indicate that we switched in the LR value
                 new_lr |= NVIC_INTERRUPT_ENTRY_LR_PSPSWITCH_FLAG;
@@ -1283,16 +1286,8 @@ uc_err init_nvic(uc_engine *uc, uint32_t vtor, uint32_t num_irq, uint32_t p_inte
     for(uint32_t i = 0; i < num_disabled_interrupts; ++i)
         config_disabled_interrupts[i] = EXCEPTION_NO_EXTERNAL_START + disabled_interrupts[i];
 
-    // Get pointers to commonly used registers
-    if(uc_reg_ptr(uc, UC_ARM_REG_PRIMASK, (void **) &nvic.reg_daif_ptr)) {
-        puts("[init_nvic] ERROR: uc_reg_tr"); exit(-1);
-    }
-    if(uc_reg_ptr(uc, UC_ARM_REG_BASEPRI, (void **) &nvic.reg_basepri_ptr)) {
-        puts("[init_nvic] ERROR: uc_reg_tr"); exit(-1);
-    }
-    if(uc_reg_ptr(uc, UC_ARM_REG_CURR_SP_MODE_IS_PSP, (void **) &reg_curr_sp_mode_is_psp_ptr)) {
-        puts("[init_nvic] ERROR: uc_reg_tr"); exit(-1);
-    }
+    // Store uc_engine pointer for Unicorn 2.x register access
+    nvic_uc = uc;
 
     // Set the vtor. If it is uninitialized, read it from actual (restored) process memory
     if(vtor == NVIC_VTOR_NONE) {
@@ -1306,7 +1301,7 @@ uc_err init_nvic(uc_engine *uc, uint32_t vtor, uint32_t num_irq, uint32_t p_inte
 
     uc_hook_add(uc, &nvic_exception_return_hook_handle, UC_HOOK_BLOCK, nvic_exception_return_hook, NULL, EXCEPT_MAGIC_RET_MASK, EXCEPT_MAGIC_RET_MASK | 0xf);
 
-    uc_hook_add(uc, &nvic_block_hook_handle, UC_HOOK_BLOCK_UNCONDITIONAL, nvic_block_hook, &nvic, 1, 0);
+    uc_hook_add(uc, &nvic_block_hook_handle, UC_HOOK_BLOCK, nvic_block_hook, &nvic, 1, 0);
 
     // 3. nvic MMIO range read/write handler
     uc_hook_add(uc, &hook_mmio_write_handle, UC_HOOK_MEM_WRITE, hook_sysctl_mmio_write, NULL, SYSCTL_MMIO_BASE, SYSCTL_MMIO_END);

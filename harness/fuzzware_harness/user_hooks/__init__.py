@@ -5,7 +5,7 @@ import struct
 import sys
 import logging
 
-from unicorn import UC_HOOK_BLOCK_UNCONDITIONAL
+from unicorn import UC_HOOK_BLOCK
 
 from .. import globs
 from ..exit import do_exit
@@ -119,7 +119,7 @@ def add_block_hook(hook):
 def maybe_register_global_block_hook(uc):
     if block_hooks:
         logger.debug("Registering block hook wrapper for {} hooks: {}".format(len(block_hooks), list(map(lambda fn: fn.__name__, block_hooks))))
-        uc.hook_add(UC_HOOK_BLOCK_UNCONDITIONAL, block_hook_handler)
+        uc.hook_add(UC_HOOK_BLOCK, block_hook_handler)
     else:
         logger.debug("No non-native unconditional basic block hooks registered, not adding global hook")
 

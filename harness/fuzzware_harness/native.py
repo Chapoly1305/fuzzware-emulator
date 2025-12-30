@@ -25,6 +25,12 @@ timer_cb_user_data = None
 # just like unicorn does we need to keep references to ctype cb objects
 obj_refs = []
 
+# Unicorn 2.x compatibility: manage our own callback count since _callback_count
+# is not available in Unicorn 2.x Python bindings
+_fuzzware_callback_count = 0
+_fuzzware_py_callbacks = {}  # callback_id -> (py_callback, user_data)
+_fuzzware_uc_instance = None  # Store reference to uc for callbacks
+
 uc_engine = ctypes.c_void_p
 # Prototyping code taken from unicorn python bindings
 def _load_lib(path):
@@ -122,30 +128,56 @@ def remove_function_handler_hook_address(uc, address):
     assert native_lib.remove_function_handler_hook_address(uc._uch, address) == 0
 
 
+def _fuzzware_mem_access_cb_wrapper(uc_handle, access, address, size, value, user_data):
+    """C callback wrapper for memory access hooks (Unicorn 2.x compatible)"""
+    global _fuzzware_py_callbacks, _fuzzware_uc_instance
+    callback_id = ctypes.cast(user_data, ctypes.c_void_p).value
+    if callback_id in _fuzzware_py_callbacks:
+        py_callback, _ = _fuzzware_py_callbacks[callback_id]
+        py_callback(_fuzzware_uc_instance, access, address, size, value, None)
+
 def _create_and_inject_c_callable_mem_hook(uc, py_fn):
-    # hack: In order to keep a uc reference around for the high level callback,
-    # we sneak an additional callback into the uc object (as done in unicorn.py)
-    callback = py_fn
-    uc._callback_count += 1
-    uc._callbacks[uc._callback_count] = (callback, None)
-    cb = ctypes.cast(UC_HOOK_MEM_ACCESS_CB(uc._hook_mem_access_cb), UC_HOOK_MEM_ACCESS_CB)
-    user_data = ctypes.cast(uc._callback_count, ctypes.c_void_p)
+    """Create a C-callable memory hook (Unicorn 2.x compatible)"""
+    global _fuzzware_callback_count, _fuzzware_py_callbacks, _fuzzware_uc_instance
+
+    # Store uc reference for callbacks
+    _fuzzware_uc_instance = uc
+
+    # Register callback with our own counter
+    _fuzzware_callback_count += 1
+    callback_id = _fuzzware_callback_count
+    _fuzzware_py_callbacks[callback_id] = (py_fn, None)
+
+    # Create ctypes callback wrapper
+    cb = UC_HOOK_MEM_ACCESS_CB(_fuzzware_mem_access_cb_wrapper)
+    user_data = ctypes.cast(callback_id, ctypes.c_void_p)
     obj_refs.append(cb)
     return cb, user_data
 
 
+def _fuzzware_timer_cb_wrapper(uc_handle, timer_id, user_data):
+    """C callback wrapper for timer hooks (Unicorn 2.x compatible)"""
+    global _fuzzware_py_callbacks, _fuzzware_uc_instance
+    callback_id = ctypes.cast(user_data, ctypes.c_void_p).value
+    if callback_id in _fuzzware_py_callbacks:
+        py_callback, _ = _fuzzware_py_callbacks[callback_id]
+        py_callback(_fuzzware_uc_instance, timer_id, None)
+
 def _create_and_inject_c_callable_central_timer_hook(uc, py_fn):
-    callback = py_fn
-    # hack: In order to keep a uc reference around for the high level callback,
-    # we sneak an additional callback into the uc object (as done in unicorn.py)
-    # even bigger hack: we re-use the prototype of interrupt callbacks for the fact of their function prototype
-    # to create an alternative callback
-    # from: cb(self, intno, data)
-    # to  : cb(self, timer_id, data)
-    uc._callback_count += 1
-    uc._callbacks[uc._callback_count] = (callback, None)
-    cb = ctypes.cast(UC_HOOK_INTR_CB(uc._hook_intr_cb), UC_HOOK_INTR_CB)
-    user_data = ctypes.cast(uc._callback_count, ctypes.c_void_p)
+    """Create a C-callable timer hook (Unicorn 2.x compatible)"""
+    global _fuzzware_callback_count, _fuzzware_py_callbacks, _fuzzware_uc_instance
+
+    # Store uc reference for callbacks
+    _fuzzware_uc_instance = uc
+
+    # Register callback with our own counter
+    _fuzzware_callback_count += 1
+    callback_id = _fuzzware_callback_count
+    _fuzzware_py_callbacks[callback_id] = (py_fn, None)
+
+    # Create ctypes callback wrapper
+    cb = UC_HOOK_INTR_CB(_fuzzware_timer_cb_wrapper)
+    user_data = ctypes.cast(callback_id, ctypes.c_void_p)
     obj_refs.append(cb)
     return cb, user_data
 

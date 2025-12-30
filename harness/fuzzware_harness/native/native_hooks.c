@@ -15,6 +15,7 @@
 #include "uc_snapshot.h"
 
 #include <unicorn/unicorn.h>
+#include "fuzzware_cov.h"
 
 #include <unistd.h>
 #include <stdint.h>
@@ -189,7 +190,7 @@ uc_err add_debug_hooks(uc_engine *uc) {
     uc_hook tmp;
     uc_err res = UC_ERR_OK;
     // Register unconditional hook for checking for handler presence
-    res |= uc_hook_add(uc, &tmp, UC_HOOK_BLOCK_UNCONDITIONAL, hook_block_debug, NULL, 1, 0);
+    res |= uc_hook_add(uc, &tmp, UC_HOOK_BLOCK, hook_block_debug, NULL, 1, 0);
     res |= uc_hook_add(uc, &tmp, UC_HOOK_MEM_WRITE | UC_HOOK_MEM_READ, hook_debug_mem_access, 0, 1, 0);
     return res;
 }
@@ -469,7 +470,7 @@ uc_err register_cond_py_handler_hook(uc_engine *uc, uc_cb_hookcode_t py_mmio_cal
 	}
 
     // Register unconditional hook for checking for handler presence
-    return uc_hook_add(uc, &hook_block_cond_py_handlers_handle, UC_HOOK_BLOCK_UNCONDITIONAL, hook_block_cond_py_handlers, user_data, 1, 0);
+    return uc_hook_add(uc, &hook_block_cond_py_handlers_handle, UC_HOOK_BLOCK, hook_block_cond_py_handlers, user_data, 1, 0);
 }
 
 uc_err remove_function_handler_hook_address(uc_engine *uc, uint64_t address) {
