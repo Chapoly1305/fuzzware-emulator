@@ -22,11 +22,24 @@ extern "C" {
  * Get the "other" stack pointer value.
  * In Cortex-M, if currently using MSP, this returns PSP and vice versa.
  *
- * Note: This reads CONTROL to determine current mode, then reads the other SP.
+ * IMPORTANT: In Handler mode, MSP is ALWAYS used regardless of CONTROL.SPSEL.
+ * CONTROL.SPSEL only affects Thread mode.
+ * So in Handler mode, the "other" SP is always PSP.
  */
 static inline uc_err uc_get_other_sp(uc_engine *uc, uint32_t *value) {
+    uint32_t xpsr;
+    uc_err err = uc_reg_read(uc, UC_ARM_REG_XPSR, &xpsr);
+    if (err != UC_ERR_OK) return err;
+
+    /* Check if in Handler mode (XPSR[8:0] != 0) */
+    if (xpsr & 0x1FF) {
+        /* In Handler mode, we're always using MSP, so "other" is PSP */
+        return uc_reg_read(uc, UC_ARM_REG_PSP, value);
+    }
+
+    /* In Thread mode, use CONTROL.SPSEL to determine current SP */
     uint32_t control;
-    uc_err err = uc_reg_read(uc, UC_ARM_REG_CONTROL, &control);
+    err = uc_reg_read(uc, UC_ARM_REG_CONTROL, &control);
     if (err != UC_ERR_OK) return err;
 
     if (control & CONTROL_SPSEL_BIT) {
@@ -58,8 +71,19 @@ static inline uc_err uc_set_other_sp(uc_engine *uc, uint32_t value) {
 /*
  * Check if currently using PSP (Process Stack Pointer).
  * Returns 1 if PSP is active, 0 if MSP is active.
+ *
+ * IMPORTANT: In Handler mode, MSP is ALWAYS used regardless of CONTROL.SPSEL.
  */
 static inline uint32_t uc_get_curr_sp_mode_is_psp(uc_engine *uc) {
+    uint32_t xpsr = 0;
+    uc_reg_read(uc, UC_ARM_REG_XPSR, &xpsr);
+
+    /* In Handler mode (XPSR[8:0] != 0), always using MSP */
+    if (xpsr & 0x1FF) {
+        return 0;
+    }
+
+    /* In Thread mode, check CONTROL.SPSEL */
     uint32_t control = 0;
     uc_reg_read(uc, UC_ARM_REG_CONTROL, &control);
     return (control & CONTROL_SPSEL_BIT) ? 1 : 0;

@@ -1,6 +1,9 @@
 #include "cortexm_nvic.h"
 #include "../unicorn2_compat.h"
 
+// Uncomment to enable debug output for NVIC
+// #define DEBUG_NVIC
+
 // We implement recalculating states lazily, but can disable that behavior
 // #define DISABLE_LAZY_RECALCS
 
@@ -972,20 +975,46 @@ static void nvic_exception_return_hook(uc_engine *uc, uint64_t address, uint32_t
     #endif
 }
 
+// EXCP_EXCEPTION_EXIT from Unicorn 2's ARM M-profile exception handling
+#define QEMU_EXCP_EXCEPTION_EXIT 8
+
 static void handler_svc(uc_engine *uc, uint32_t intno, void *user_data) {
-    #ifdef DEBUG_NVIC
     uint32_t pc;
     uc_reg_read(uc, UC_ARM_REG_PC, &pc);
+
+    #ifdef DEBUG_NVIC
     printf("[SVC HOOK %08x] native SVC hook called, intno: %d\n", pc, intno); fflush(stdout);
     #endif
+
+    // Handle EXCP_EXCEPTION_EXIT (Unicorn 2 M-profile exception return)
+    // This happens when PC is in the magic return address range (0xffffff0x)
+    if(intno == QEMU_EXCP_EXCEPTION_EXIT) {
+        // Check if PC is in the exception return magic address range
+        if((pc & EXCEPT_MAGIC_RET_MASK) == EXCEPT_MAGIC_RET_MASK) {
+            // Unicorn 2 may clear the LSB (Thumb bit) from EXC_RETURN values.
+            // EXC_RETURN values must have bit 0 set for Cortex-M (Thumb mode required).
+            // Fix by ensuring bit 0 is set.
+            uint32_t exc_return = pc | 1;
+            #ifdef DEBUG_NVIC
+            uint32_t psp_val, msp_val, control_val;
+            uc_reg_read(uc, UC_ARM_REG_PSP, &psp_val);
+            uc_reg_read(uc, UC_ARM_REG_MSP, &msp_val);
+            uc_reg_read(uc, UC_ARM_REG_CONTROL, &control_val);
+            printf("[SVC HOOK] Handling M-profile exception return at PC=0x%08x (exc_return=0x%08x)\n", pc, exc_return);
+            printf("[SVC HOOK] Before ExceptionReturn: PSP=0x%08x, MSP=0x%08x, CONTROL=0x%08x\n", psp_val, msp_val, control_val);
+            fflush(stdout);
+            #endif
+            ExceptionReturn(uc, exc_return);
+            return;
+        }
+        // If not in magic return range, fall through to error handling
+    }
 
     // Make sure we are actually asked to perform a syscall
     if(intno == 2) {
         #ifndef SKIP_CHECK_SVC_ACTIVE_INTERRUPT_PRIO
         if(nvic.active_group_prio <= nvic.ExceptionPriority[EXCEPTION_NO_SVC]) {
             if(do_print_exit_info) {
-                uint32_t pc;
-                uc_reg_read(uc, UC_ARM_REG_PC, &pc);
                 printf("[SVC HOOK %08x] primask is set, so interrupts are masked. SVC prio: %d. As this would escalate to hardfault, exiting\n", pc, nvic.ExceptionPriority[EXCEPTION_NO_SVC]); fflush(stdout);
             }
             do_exit(uc, UC_ERR_EXCEPTION);
@@ -998,8 +1027,6 @@ static void handler_svc(uc_engine *uc, uint32_t intno, void *user_data) {
     } else {
         // Alternatives could be breakpoints and the like, which we do not handle.
         if(do_print_exit_info) {
-            uint32_t pc;
-            uc_reg_read(uc, UC_ARM_REG_PC, &pc);
             printf("[SVC HOOK %08x] %d is NOT an SVC, exiting\n", pc, intno); fflush(stdout);
         }
         do_exit(uc, UC_ERR_OK);
@@ -1295,8 +1322,9 @@ uc_err init_nvic(uc_engine *uc, uint32_t vtor, uint32_t num_irq, uint32_t p_inte
         printf("[NVIC] Recovered vtor base: %x\n", nvic.vtor); fflush(stdout);
     } else {
         // We have MMIO vtor read fall through, so put vtor value in emulated memory
-        uc_mem_write(uc, SYSCTL_VTOR, &nvic.vtor, sizeof(nvic.vtor));
+        // IMPORTANT: Set nvic.vtor BEFORE writing to memory (bug fix: order was reversed)
         nvic.vtor = vtor;
+        uc_mem_write(uc, SYSCTL_VTOR, &nvic.vtor, sizeof(nvic.vtor));
     }
 
     uc_hook_add(uc, &nvic_exception_return_hook_handle, UC_HOOK_BLOCK, nvic_exception_return_hook, NULL, EXCEPT_MAGIC_RET_MASK, EXCEPT_MAGIC_RET_MASK | 0xf);

@@ -66,9 +66,10 @@ UC_HOOK_INTR_CB = ctypes.CFUNCTYPE(
 
 mmio_user_data = None
 def add_mmio_region(uc, start, end):
-    global mmio_user_data
+    global mmio_user_data, _fuzzware_callback_count
     if mmio_user_data is None:
-        mmio_user_data = ctypes.cast(uc._callback_count, ctypes.c_void_p)
+        # Unicorn 2.x compatibility: use our own callback counter
+        mmio_user_data = ctypes.cast(_fuzzware_callback_count, ctypes.c_void_p)
     assert native_lib.add_mmio_region(uc._uch, start, end, mmio_user_data)==0
 
 def load_fuzz(file_path):
@@ -102,26 +103,42 @@ def get_latest_mmio_fuzz_access_size():
 def get_latest_mmio_fuzz_access_index():
     return native_lib.get_latest_mmio_fuzz_access_index()
 
+def _fuzzware_code_cb_wrapper(uc_handle, address, size, user_data):
+    """C callback wrapper for code hooks (Unicorn 2.x compatible)"""
+    global _fuzzware_py_callbacks, _fuzzware_uc_instance
+    callback_id = ctypes.cast(user_data, ctypes.c_void_p).value
+    if callback_id in _fuzzware_py_callbacks:
+        py_callback, _ = _fuzzware_py_callbacks[callback_id]
+        py_callback(_fuzzware_uc_instance, address, size, None)
+
 def register_cond_py_handler_hook(uc, handler_locs):
+    global _fuzzware_callback_count, _fuzzware_py_callbacks, _fuzzware_uc_instance
+
     if not handler_locs:
         logger.warning("no function handler hooks registered, skipping registration")
         return
 
     arr = (ctypes.c_int64 * len(handler_locs))(*handler_locs)
 
-    # hack: In order to keep a uc reference around for the high level callback,
-    # we sneak an additional callback into the uc object (as done in unicorn.py)
+    # Unicorn 2.x compatibility: use our own callback management
     from .user_hooks import func_hook_handler
-    callback = func_hook_handler
-    uc._callback_count += 1
-    uc._callbacks[uc._callback_count] = (callback, None)
-    cb = ctypes.cast(UC_HOOK_CODE_CB(uc._hookcode_cb), UC_HOOK_CODE_CB)
-    user_data = ctypes.cast(uc._callback_count, ctypes.c_void_p)
+
+    # Store uc reference for callbacks
+    _fuzzware_uc_instance = uc
+
+    # Register callback with our own counter
+    _fuzzware_callback_count += 1
+    callback_id = _fuzzware_callback_count
+    _fuzzware_py_callbacks[callback_id] = (func_hook_handler, None)
+
+    # Create ctypes callback wrapper
+    cb = UC_HOOK_CODE_CB(_fuzzware_code_cb_wrapper)
+    user_data = ctypes.cast(callback_id, ctypes.c_void_p)
+    obj_refs.append(cb)
 
     assert native_lib.register_cond_py_handler_hook(
         uc._uch, cb, arr, len(arr), user_data
     ) == 0
-    obj_refs.append(cb)
 
 
 def remove_function_handler_hook_address(uc, address):

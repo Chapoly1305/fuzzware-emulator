@@ -1123,7 +1123,7 @@ class Uc(RegStateManager):
             uc.UC_HOOK_MEM_READ           : __hook_mem,
             uc.UC_HOOK_MEM_WRITE          : __hook_mem,
             uc.UC_HOOK_MEM_FETCH          : __hook_mem,
-            # uc.UC_HOOK_MEM_READ_AFTER
+            uc.UC_HOOK_MEM_READ_AFTER     : __hook_mem,
             uc.UC_HOOK_INSN_INVALID       : __hook_invalid_insn,
             uc.UC_HOOK_EDGE_GENERATED     : __hook_edge_gen,
             uc.UC_HOOK_TCG_OPCODE         : __hook_tcg_opcode,
