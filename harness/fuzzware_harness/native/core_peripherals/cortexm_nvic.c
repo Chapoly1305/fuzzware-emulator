@@ -765,9 +765,19 @@ void hook_sysctl_mmio_write(uc_engine *uc, uc_mem_type type,
 }
 
 // Armv7-M ARM B1.5.8
-void PopStack(uc_engine *uc) {
+// use_psp: true if the exception frame is on PSP, false if on MSP
+// This parameter is needed because Unicorn 2's UC_ARM_REG_SP is mode-dependent:
+// In Handler mode, it always returns MSP regardless of CONTROL.SPSEL.
+// During exception return, we're still in Handler mode until xPSR is restored,
+// so we must explicitly specify which stack to read from based on EXC_RETURN flags.
+void PopStack(uc_engine *uc, bool use_psp) {
     uint32_t frameptr;
-    uc_reg_read(uc, UC_ARM_REG_SP, &frameptr);
+    // Read from the correct physical stack register based on where the frame was pushed
+    if (use_psp) {
+        uc_reg_read(uc, UC_ARM_REG_PSP, &frameptr);
+    } else {
+        uc_reg_read(uc, UC_ARM_REG_MSP, &frameptr);
+    }
     uc_err err;
 
     #ifdef DEBUG_NVIC
@@ -791,14 +801,25 @@ void PopStack(uc_engine *uc) {
         saved_regs.sp += 4;
     }
 
-    // Here we restore all registers in one go, including sp
-    if((err = uc_reg_write_batch(uc, &saved_reg_ids[0], (void **)(&saved_reg_ptrs[0]), NUM_SAVED_REGS)) != UC_ERR_OK){
+    // Restore all registers EXCEPT SP (NUM_SAVED_REGS - 1).
+    // We handle SP separately because UC_ARM_REG_SP is mode-dependent in Unicorn 2,
+    // and we're still technically in Handler mode until xPSR is restored.
+    if((err = uc_reg_write_batch(uc, &saved_reg_ids[0], (void **)(&saved_reg_ptrs[0]), NUM_SAVED_REGS - 1)) != UC_ERR_OK){
         if(do_print_exit_info) {
             puts("[NVIC ERROR] PopStack: restoring registers failed\n");
             print_state(uc);
             fflush(stdout);
         }
         force_crash(uc, err);
+    }
+
+    // Write the new SP value to the correct physical stack register.
+    // We must do this explicitly because UC_ARM_REG_SP in Unicorn 2 is mode-dependent
+    // and would go to the wrong register if we're returning to a different mode.
+    if (use_psp) {
+        uc_reg_write(uc, UC_ARM_REG_PSP, &saved_regs.sp);
+    } else {
+        uc_reg_write(uc, UC_ARM_REG_MSP, &saved_regs.sp);
     }
 
     // Restore the stored active irq
@@ -926,26 +947,22 @@ void ExceptionReturn(uc_engine *uc, uint32_t ret_pc) {
 
     // If we don't tail-chain, we need to pop the current stack state
 
-    // Are we returning to thread mode?
+    // Determine which stack the exception frame is on based on EXC_RETURN flags.
+    // PSPSWITCH_FLAG indicates the frame was pushed to PSP during exception entry.
+    bool frame_on_psp = (ret_pc & NVIC_INTERRUPT_ENTRY_LR_PSPSWITCH_FLAG) != 0;
+
+    // Pop the exception frame from the correct stack
+    PopStack(uc, frame_on_psp);
+
+    // Are we returning to thread mode with PSP?
     if(ret_pc & NVIC_INTERRUPT_ENTRY_LR_THREADMODE_FLAG) {
-        // Need to change stack to SP_process
         if(ret_pc & NVIC_INTERRUPT_ENTRY_LR_PSPSWITCH_FLAG) {
-            // We are coming from Handler Mode (which always uses SP_main) and
-            // return to Thread Mode which uses SP_process. Switch to SP_process
-            uint32_t SP_process, SP_main;
-            uc_reg_read(uc, UC_ARM_REG_SP, &SP_main);
-            uc_get_other_sp(uc, &SP_process);
-
-            // Back up SP_main to MSP, switch SP to PSP value
-            uc_reg_write(uc, UC_ARM_REG_MSP, &SP_main);
-            uc_reg_write(uc, UC_ARM_REG_SP, &SP_process);
-
-            // Switch the CPU state to indicate the new SPSEL state (use PSP)
+            // Returning to Thread Mode which uses SP_process.
+            // After PopStack, the correct SP values are now in the physical registers.
+            // We just need to switch the CPU state to indicate we're now using PSP.
             uc_set_spsel(uc, 1);
         }
     }
-
-    PopStack(uc);
 
     if(((ret_pc & NVIC_INTERRUPT_ENTRY_LR_THREADMODE_FLAG) != 0) != (nvic.active_irq == NVIC_NONE_ACTIVE)) {
         if(do_print_exit_info) {
@@ -977,6 +994,11 @@ static void nvic_exception_return_hook(uc_engine *uc, uint64_t address, uint32_t
 
 // EXCP_EXCEPTION_EXIT from Unicorn 2's ARM M-profile exception handling
 #define QEMU_EXCP_EXCEPTION_EXIT 8
+// EXCP_NOCP from Unicorn 2 - No Coprocessor UsageFault (e.g., FPU not enabled)
+#define QEMU_EXCP_NOCP 17
+// ARM Cortex-M exception numbers for fault handling
+#define EXCEPTION_NO_HARDFAULT 3
+#define EXCEPTION_NO_USAGEFAULT 6
 
 static void handler_svc(uc_engine *uc, uint32_t intno, void *user_data) {
     uint32_t pc;
@@ -1024,6 +1046,14 @@ static void handler_svc(uc_engine *uc, uint32_t intno, void *user_data) {
         // SVCs are enabled by default. Just pend the SVC exception here
         pend_interrupt(uc, EXCEPTION_NO_SVC);
         maybe_activate(uc, false);
+    } else if(intno == QEMU_EXCP_NOCP) {
+        // NOCP UsageFault: coprocessor instruction but coprocessor not enabled (e.g., FPU)
+        // This typically means execution jumped to a wrong address (data interpreted as FPU instruction)
+        // Exit cleanly rather than infinite loop through HardFault
+        if(do_print_exit_info) {
+            printf("[SVC HOOK %08x] NOCP UsageFault (intno=%d) - execution reached non-code address, exiting cleanly\n", pc, intno); fflush(stdout);
+        }
+        do_exit(uc, UC_ERR_OK);
     } else {
         // Alternatives could be breakpoints and the like, which we do not handle.
         if(do_print_exit_info) {
@@ -1075,11 +1105,15 @@ static void ExceptionEntry(uc_engine *uc, bool is_tail_chained, bool skip_instru
                 uc_reg_read(uc, UC_ARM_REG_SP, &SP_process);
                 uc_get_other_sp(uc, &SP_main);
 
-                // Back up SP_process to PSP, switch SP to MSP value
+                // Back up SP_process to PSP register explicitly
                 uc_reg_write(uc, UC_ARM_REG_PSP, &SP_process);
-                uc_reg_write(uc, UC_ARM_REG_SP, &SP_main);
 
-                // Switch the CPU state to indicate the new SPSEL state (use MSP)
+                // IMPORTANT: In Unicorn 2, UC_ARM_REG_SP is mode-dependent.
+                // With SPSEL=1, writing to SP would write to PSP, not MSP!
+                // We must write to MSP explicitly to avoid corrupting PSP.
+                uc_reg_write(uc, UC_ARM_REG_MSP, &SP_main);
+
+                // Switch the CPU state to indicate we're now using MSP (SPSEL=0)
                 uc_set_spsel(uc, 0);
 
                 // Finally: Indicate that we switched in the LR value
@@ -1089,8 +1123,9 @@ static void ExceptionEntry(uc_engine *uc, bool is_tail_chained, bool skip_instru
     } else {
         // Tail Chaining: going from handler mode to handler mode. No stack switching required
         uint32_t prev_lr;
-        // If we are chained, maintain the previous lr's SP switch and thread mode bits
-        uc_reg_read(uc, UC_ARM_REG_PC, &prev_lr);
+        // Read LR which contains the EXC_RETURN value with stack/mode flags
+        uc_reg_read(uc, UC_ARM_REG_LR, &prev_lr);
+        // Preserve the PSP switch and thread mode flags from the previous exception entry
         new_lr |= (prev_lr & (NVIC_INTERRUPT_ENTRY_LR_PSPSWITCH_FLAG | NVIC_INTERRUPT_ENTRY_LR_THREADMODE_FLAG));
     }
 
