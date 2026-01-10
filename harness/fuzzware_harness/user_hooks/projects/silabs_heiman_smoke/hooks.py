@@ -1,15 +1,28 @@
-# Custom hooks for Heiman Smoke Detector (Silicon Labs EFR32 Zigbee)
-# Direct UART fuzzing harness - injects fuzz input as UART protocol messages
+"""
+Heiman Smoke Detector - Project-Specific Hooks
+
+Custom hooks for Heiman Smoke Detector firmware (Silicon Labs EFR32MG1x Zigbee).
+This module provides device-specific UART protocol handling, radio hardware bypass,
+and firmware-specific hooks for the Heiman smoke detector.
+
+Features:
+- UART protocol fuzzing with custom packet format (0xAA55 magic, CRC)
+- Radio/RAIL/Zigbee hardware bypass hooks
+- Crypto, flash, and GPIO hooks for EFR32MG1x
+- Interrupt injection and queue interception
+"""
 import sys
 import os
 from unicorn.arm_const import UC_ARM_REG_R0, UC_ARM_REG_R1, UC_ARM_REG_R2, UC_ARM_REG_R3, UC_ARM_REG_LR, UC_ARM_REG_PC, UC_ARM_REG_SP
 
-# Import fuzz input functions
-from ..fuzz import get_fuzz
+# Import fuzz input functions (note: three dots for projects subdirectory)
+from ...fuzz import get_fuzz
 
-# Log file path
+# Log file paths
 LOG_FILE_PATH = os.environ.get('FUZZWARE_LOG_FILE', '/tmp/fuzzware_heiman.log')
+UART_LOG_FILE = os.environ.get('UART_LOG_FILE', '/tmp/uart_txrx.log')
 _log_file = None
+_uart_log_file = None
 _log_enabled = os.environ.get('FUZZWARE_LOG_LEVEL', 'WARN').upper() in ('DEBUG', 'INFO')
 
 def _get_log_file():
@@ -25,6 +38,47 @@ def _log(msg):
         f = _get_log_file()
         f.write(msg)
         f.flush()
+
+
+def _get_uart_log_file():
+    """Get or create the UART log file handle"""
+    global _uart_log_file
+    if _uart_log_file is None:
+        _uart_log_file = open(UART_LOG_FILE, 'a')
+        # Write CSV header if file is new/empty
+        try:
+            if os.path.getsize(UART_LOG_FILE) == 0:
+                _uart_log_file.write("timestamp,direction,hex\n")
+        except:
+            _uart_log_file.write("timestamp,direction,hex\n")
+    return _uart_log_file
+
+
+def _log_uart_packet(direction, data, notes=""):
+    """
+    Log UART packet to CSV file
+
+    Args:
+        direction: "RX" or "TX" (from firmware perspective)
+        data: bytes, bytearray, or hex string
+        notes: ignored (for compatibility)
+    """
+    import time
+
+    f = _get_uart_log_file()
+    timestamp = f"{time.time():.3f}"
+
+    # Convert to hex string without spaces
+    if isinstance(data, (bytes, bytearray)):
+        hex_data = data.hex()
+    elif isinstance(data, str):
+        hex_data = data.replace(" ", "").replace("0x", "")
+    else:
+        hex_data = ""
+
+    # Write CSV line: timestamp,direction,hex
+    f.write(f"{timestamp},{direction},{hex_data}\n")
+    f.flush()
 
 
 # ============================================================================
@@ -110,8 +164,18 @@ def QueuePutWrapper_intercept(uc):
         uart_area = uc.mem_read(UART_RX_BUFFER_ADDR, 64)
         if b'\xaa\x55' in uart_area:
             print(f"[UART_RESPONSE] UART buffer: {uart_area.hex()}", file=sys.stderr, flush=True)
-    except:
-        pass
+
+            # Log UART TX packet to file with formatting
+            # Find the packet length
+            aa55_idx = uart_area.find(b'\xaa\x55')
+            if aa55_idx != -1 and aa55_idx + 3 < len(uart_area):
+                packet_len = uart_area[aa55_idx + 2] + 4  # length byte + magic(2) + len(1) + crc(2) - 1
+                if aa55_idx + packet_len <= len(uart_area):
+                    uart_packet = bytes(uart_area[aa55_idx:aa55_idx + packet_len])
+                    _log_uart_packet("TX", uart_packet, "Firmware response captured via QueuePutWrapper")
+    except Exception as e:
+        # Log errors but don't crash the emulator
+        print(f"[UART_TX_ERROR] Failed to log TX packet: {e}", file=sys.stderr, flush=True)
 
     uc.reg_write(UC_ARM_REG_R0, 0)
 
@@ -215,6 +279,9 @@ def UARTDRV_Receive(uc):
     uc.mem_write(buffer_ptr, uart_packet[:write_len])
 
     _log(f"[UART] Injected {write_len} bytes: {uart_packet[:write_len].hex()}\n")
+
+    # Log UART RX packet to file with formatting
+    _log_uart_packet("RX", uart_packet[:write_len], "Fuzz input via UARTDRV_Receive")
 
     # Return ECODE_EMDRV_UARTDRV_OK (0)
     uc.reg_write(UC_ARM_REG_R0, 0)
@@ -745,7 +812,7 @@ def uart_interrupt_inject(uc):
     It preserves the current execution context and returns after processing.
     """
     import ctypes
-    from ... import native
+    from fuzzware_harness import native
 
     try:
         uc_handle = uc._uch
@@ -825,7 +892,7 @@ def start_uart_fuzzing(uc):
     print("[UART_FUZZ] Hook entry", file=sys.stderr, flush=True)
     _log("[UART_FUZZ] Intercepted sl_kernel_start, redirecting to UART parsing\n")
 
-    from ... import native
+    from fuzzware_harness import native
 
     try:
         # Get the raw Unicorn handle
@@ -897,6 +964,9 @@ def start_uart_fuzzing(uc):
     uc.mem_write(FUZZ_BUFFER_ADDR, uart_packet)
 
     _log(f"[UART_FUZZ] Prepared {len(uart_packet)} byte packet: {uart_packet.hex()}\n")
+
+    # Log UART RX packet to file with formatting
+    _log_uart_packet("RX", uart_packet, "Fuzz input wrapped with UART protocol")
 
     # Simply set up registers and branch to UART_ParsePackets
     # The hook patches the function with bx lr, so we set LR to our infinite loop
