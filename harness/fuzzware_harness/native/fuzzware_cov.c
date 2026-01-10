@@ -1,6 +1,12 @@
 /* Fuzzware Coverage Tracking Implementation for Unicorn 2.x
  *
- * Implements AFL-compatible edge coverage using UC_HOOK_EDGE_GENERATED.
+ * Implements AFL-compatible edge coverage using UC_HOOK_BLOCK.
+ *
+ * NOTE: Originally used UC_HOOK_EDGE_GENERATED, but that only fires when
+ * NEW edges are JIT compiled. In persistent mode, after the first run,
+ * all blocks are cached and no new edges are generated - breaking coverage.
+ *
+ * UC_HOOK_BLOCK fires on every block execution, enabling persistent mode.
  */
 
 #include "fuzzware_cov.h"
@@ -20,16 +26,20 @@ static inline uint32_t hash_addr(uint64_t addr) {
 }
 
 /*
- * Edge generation callback - called when a new edge is taken.
+ * Block execution callback - called when each block is executed.
  * This is the core of AFL-style coverage tracking.
+ *
+ * Using UC_HOOK_BLOCK instead of UC_HOOK_EDGE_GENERATED because
+ * the latter only fires when new edges are JIT compiled, which
+ * doesn't work in persistent mode where blocks are cached.
  */
-static void hook_edge_gen(uc_engine *uc, uc_tb *cur_tb, uc_tb *prev_tb, void *user_data) {
-    if (!cov_bitmap || !cur_tb) {
+static void hook_block(uc_engine *uc, uint64_t address, uint32_t size, void *user_data) {
+    if (!cov_bitmap) {
         return;
     }
 
     /* Calculate current location hash */
-    uint32_t cur_loc = hash_addr(cur_tb->pc);
+    uint32_t cur_loc = hash_addr(address);
 
     /* Update coverage bitmap: bitmap[cur_loc ^ prev_loc]++ */
     uint32_t index = (cur_loc ^ cov_prev_loc) & (cov_bitmap_size - 1);
@@ -59,12 +69,14 @@ uc_err uc_fuzzer_init_cov(uc_engine *uc, uint8_t *bitmap, uint32_t bitmap_size) 
     /* Clear bitmap */
     memset(bitmap, 0, bitmap_size);
 
-    /* Register edge generation hook */
-    err = uc_hook_add(uc, &cov_hook_handle, UC_HOOK_EDGE_GENERATED,
-                      (void *)hook_edge_gen, NULL, 1, 0);
+    /* Register block execution hook for coverage tracking
+     * Using UC_HOOK_BLOCK which fires on every block execution,
+     * unlike UC_HOOK_EDGE_GENERATED which only fires on first JIT compilation */
+    err = uc_hook_add(uc, &cov_hook_handle, UC_HOOK_BLOCK,
+                      (void *)hook_block, NULL, 1, 0);
 
     if (err != UC_ERR_OK) {
-        fprintf(stderr, "[COV] Failed to add edge generation hook: %s\n",
+        fprintf(stderr, "[COV] Failed to add block hook: %s\n",
                 uc_strerror(err));
         cov_bitmap = NULL;
         cov_bitmap_size = 0;

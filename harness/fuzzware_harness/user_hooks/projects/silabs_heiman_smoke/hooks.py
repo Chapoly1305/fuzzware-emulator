@@ -875,50 +875,108 @@ def uart_interrupt_inject(uc):
         pass  # Silently ignore errors in interrupt context
 
 
+_discovery_triggered = False
+
 def trigger_fuzz_consumption(uc):
     """
     Early fuzz consumption trigger for discovery phase.
 
-    This function attempts to consume 1 byte of fuzz input, allowing
-    Fuzzware's discovery phase to detect the fuzz consumption point
-    and set up the fork server correctly.
+    Uses a static flag to ensure we only consume fuzz once (during discovery).
+    After the first call, this hook becomes a no-op.
 
     IMPORTANT: This hook MUST be configured with do_return: false
     to allow normal execution to continue after triggering consumption.
-
-    Usage in config.yml:
-        _start:
-            handler: fuzzware_harness.user_hooks.projects.silabs_heiman_smoke.hooks.trigger_fuzz_consumption
-            do_return: false
     """
+    global _discovery_triggered
     import ctypes
     from fuzzware_harness import native
 
+    # Skip if already triggered (we're in normal execution, not discovery)
+    if _discovery_triggered:
+        print("[FUZZ] Skipping - discovery already completed", file=sys.stderr, flush=True)
+        return
+
     try:
-        # Get native Unicorn handle
         uc_handle = uc._uch
+        print("[DISCOVERY] Attempting fuzz consumption for discovery phase", file=sys.stderr, flush=True)
 
-        print("[DISCOVERY] Attempting fuzz consumption", file=sys.stderr, flush=True)
-
-        # ALWAYS attempt to call get_fuzz_ptr, even if remaining == 0
-        # This is critical because during discovery phase, get_fuzz_ptr
-        # will detect is_discovery_child=1 and exit with tick count
+        # Call get_fuzz_ptr() which will either:
+        # - In discovery child: detect is_discovery_child=1 and exit with tick count
+        # - In normal execution: return a fuzz byte
         ptr_addr = native.native_lib.get_fuzz_ptr(uc_handle, 1)
 
         if ptr_addr and ptr_addr != 0:
-            # Successfully consumed fuzz
+            # We got a fuzz byte - this means we're in normal execution (not discovery child)
+            # Mark as triggered so we skip on subsequent calls
+            _discovery_triggered = True
             byte_val = (ctypes.c_char * 1).from_address(ptr_addr).raw
-            print(f"[DISCOVERY] Fuzz consumed: {byte_val.hex()}", file=sys.stderr, flush=True)
+            print(f"[DISCOVERY] Consumed first byte: {byte_val.hex()} - will skip future calls",
+                  file=sys.stderr, flush=True)
         else:
-            # No fuzz available (expected during discovery phase initial run)
-            print("[DISCOVERY] No fuzz available (discovery exit should have triggered)", file=sys.stderr, flush=True)
+            print("[DISCOVERY] No fuzz available", file=sys.stderr, flush=True)
 
     except Exception as e:
-        # Log error but don't crash
-        print(f"[DISCOVERY] Error in trigger: {e}", file=sys.stderr, flush=True)
+        print(f"[FUZZ] Error in trigger: {e}", file=sys.stderr, flush=True)
 
     # Return normally - do NOT modify execution flow
-    # The firmware should continue to boot and initialize FreeRTOS
+
+
+_boot_count = 0
+_trace_counter = 0
+
+def debug_trace(uc):
+    """Generic trace hook."""
+    global _trace_counter
+    _trace_counter += 1
+    pc = uc.reg_read(UC_ARM_REG_PC)
+    if _trace_counter <= 20:  # Only first 20 calls
+        print(f"[TRACE {_trace_counter}] PC=0x{pc:08x}", file=sys.stderr, flush=True)
+
+def debug_kernel_start(uc):
+    """Debug hook to trace when kernel start is called."""
+    global _boot_count
+    _boot_count += 1
+    pc = uc.reg_read(UC_ARM_REG_PC)
+    print(f"[DEBUG BOOT {_boot_count}] _start called at PC=0x{pc:08x}", file=sys.stderr, flush=True)
+    # Continue normally (do_return: false in config)
+
+
+def debug_scheduler_start(uc):
+    """Debug hook to trace when vTaskStartScheduler is called."""
+    global _boot_count
+    pc = uc.reg_read(UC_ARM_REG_PC)
+    print(f"[DEBUG BOOT {_boot_count}] start() called at PC=0x{pc:08x}", file=sys.stderr, flush=True)
+    # Continue normally (do_return: false in config)
+
+
+def debug_idle_hook(uc):
+    """Debug hook to trace idle task execution."""
+    global _boot_count
+    print(f"[DEBUG BOOT {_boot_count}] sl_platform_init called", file=sys.stderr, flush=True)
+    # Continue normally (do_return: false in config)
+
+
+def debug_kernel_real(uc):
+    """Debug hook for the real sl_kernel_start."""
+    global _boot_count
+    pc = uc.reg_read(UC_ARM_REG_PC)
+    print(f"[DEBUG BOOT {_boot_count}] sl_kernel_start (real) at PC=0x{pc:08x}", file=sys.stderr, flush=True)
+
+
+def debug_abort(uc):
+    """Debug hook for abort calls."""
+    global _boot_count
+    pc = uc.reg_read(UC_ARM_REG_PC)
+    lr = uc.reg_read(UC_ARM_REG_LR)
+    print(f"[DEBUG BOOT {_boot_count}] ABORT called! PC=0x{pc:08x} LR=0x{lr:08x}", file=sys.stderr, flush=True)
+
+
+def debug_assert(uc):
+    """Debug hook for assert calls."""
+    global _boot_count
+    pc = uc.reg_read(UC_ARM_REG_PC)
+    lr = uc.reg_read(UC_ARM_REG_LR)
+    print(f"[DEBUG BOOT {_boot_count}] ASSERT failed! PC=0x{pc:08x} LR=0x{lr:08x}", file=sys.stderr, flush=True)
 
 
 def start_uart_fuzzing(uc):
@@ -1037,3 +1095,81 @@ def start_uart_fuzzing(uc):
 
     # Return False to let execution continue at new PC (not the patched bx lr)
     return False
+
+
+# ============================================================================
+# Trace hooks for debugging FreeRTOS boot sequence
+# ============================================================================
+
+def trace_vStartFirstTask(uc):
+    """Trace hook for vStartFirstTask - this starts the first FreeRTOS task."""
+    pc = uc.reg_read(UC_ARM_REG_PC)
+    lr = uc.reg_read(UC_ARM_REG_LR)
+    print(f"[FREERTOS] vStartFirstTask called! PC=0x{pc:08x} LR=0x{lr:08x}", file=sys.stderr, flush=True)
+
+
+def trace_osKernelStart(uc):
+    """Trace hook for osKernelStart - CMSIS-RTOS kernel start."""
+    pc = uc.reg_read(UC_ARM_REG_PC)
+    lr = uc.reg_read(UC_ARM_REG_LR)
+    print(f"[FREERTOS] osKernelStart called! PC=0x{pc:08x} LR=0x{lr:08x}", file=sys.stderr, flush=True)
+
+
+def trace_vTaskStartScheduler(uc):
+    """Trace hook for vTaskStartScheduler - starts FreeRTOS scheduler."""
+    pc = uc.reg_read(UC_ARM_REG_PC)
+    lr = uc.reg_read(UC_ARM_REG_LR)
+    print(f"[FREERTOS] vTaskStartScheduler called! PC=0x{pc:08x} LR=0x{lr:08x}", file=sys.stderr, flush=True)
+
+
+def trace_AppTaskLoop(uc):
+    """Trace hook for AppTaskLoop - main application task."""
+    pc = uc.reg_read(UC_ARM_REG_PC)
+    lr = uc.reg_read(UC_ARM_REG_LR)
+    print(f"[FREERTOS] AppTaskLoop called! PC=0x{pc:08x} LR=0x{lr:08x}", file=sys.stderr, flush=True)
+
+
+def trace_StartJoinHandler(uc):
+    """Trace hook for StartJoinHandler - Zigbee join start."""
+    pc = uc.reg_read(UC_ARM_REG_PC)
+    lr = uc.reg_read(UC_ARM_REG_LR)
+    print(f"[FREERTOS] StartJoinHandler called! PC=0x{pc:08x} LR=0x{lr:08x}", file=sys.stderr, flush=True)
+
+
+def trace_xTaskCreateStatic(uc):
+    """Trace hook for xTaskCreateStatic - task creation."""
+    pc = uc.reg_read(UC_ARM_REG_PC)
+    lr = uc.reg_read(UC_ARM_REG_LR)
+    print(f"[FREERTOS] xTaskCreateStatic called! PC=0x{pc:08x} LR=0x{lr:08x}", file=sys.stderr, flush=True)
+
+
+def trace_ram_callback(uc):
+    """Debug trace when execution reaches RAM callback at 0x20002cb0."""
+    pc = uc.reg_read(UC_ARM_REG_PC)
+    lr = uc.reg_read(UC_ARM_REG_LR)
+    sp = uc.reg_read(UC_ARM_REG_SP)
+    r0 = uc.reg_read(UC_ARM_REG_R0)
+    print(f"[RAM_CALLBACK] Hit 0x20002cb0! PC=0x{pc:08x} LR=0x{lr:08x} SP=0x{sp:08x} R0=0x{r0:08x}", file=sys.stderr, flush=True)
+    # Read first few bytes at this address to see what code is there
+    try:
+        code = uc.mem_read(0x20002cb0, 8)
+        print(f"[RAM_CALLBACK] Code at 0x20002cb0: {code.hex()}", file=sys.stderr, flush=True)
+    except:
+        print(f"[RAM_CALLBACK] Could not read code at 0x20002cb0", file=sys.stderr, flush=True)
+
+
+def skip_ram_callback(uc):
+    """Skip execution at uninitialized RAM callback - return to caller."""
+    lr = uc.reg_read(UC_ARM_REG_LR)
+    # Set PC to LR to return from this "function"
+    uc.reg_write(UC_ARM_REG_PC, lr)
+    # Return False to continue execution at the new PC
+    return False
+
+
+def sl_sleeptimer_get_timer_frequency_high(uc):
+    """
+    Return high frequency for FreeRTOS configTICK_RATE_HZ check.
+    Some firmware uses tick rates > 32768 Hz, so return 1MHz.
+    """
+    uc.reg_write(UC_ARM_REG_R0, 1000000)  # 1MHz
