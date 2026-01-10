@@ -875,6 +875,52 @@ def uart_interrupt_inject(uc):
         pass  # Silently ignore errors in interrupt context
 
 
+def trigger_fuzz_consumption(uc):
+    """
+    Early fuzz consumption trigger for discovery phase.
+
+    This function attempts to consume 1 byte of fuzz input, allowing
+    Fuzzware's discovery phase to detect the fuzz consumption point
+    and set up the fork server correctly.
+
+    IMPORTANT: This hook MUST be configured with do_return: false
+    to allow normal execution to continue after triggering consumption.
+
+    Usage in config.yml:
+        _start:
+            handler: fuzzware_harness.user_hooks.projects.silabs_heiman_smoke.hooks.trigger_fuzz_consumption
+            do_return: false
+    """
+    import ctypes
+    from fuzzware_harness import native
+
+    try:
+        # Get native Unicorn handle
+        uc_handle = uc._uch
+
+        print("[DISCOVERY] Attempting fuzz consumption", file=sys.stderr, flush=True)
+
+        # ALWAYS attempt to call get_fuzz_ptr, even if remaining == 0
+        # This is critical because during discovery phase, get_fuzz_ptr
+        # will detect is_discovery_child=1 and exit with tick count
+        ptr_addr = native.native_lib.get_fuzz_ptr(uc_handle, 1)
+
+        if ptr_addr and ptr_addr != 0:
+            # Successfully consumed fuzz
+            byte_val = (ctypes.c_char * 1).from_address(ptr_addr).raw
+            print(f"[DISCOVERY] Fuzz consumed: {byte_val.hex()}", file=sys.stderr, flush=True)
+        else:
+            # No fuzz available (expected during discovery phase initial run)
+            print("[DISCOVERY] No fuzz available (discovery exit should have triggered)", file=sys.stderr, flush=True)
+
+    except Exception as e:
+        # Log error but don't crash
+        print(f"[DISCOVERY] Error in trigger: {e}", file=sys.stderr, flush=True)
+
+    # Return normally - do NOT modify execution flow
+    # The firmware should continue to boot and initialize FreeRTOS
+
+
 def start_uart_fuzzing(uc):
     """
     Hook for sl_kernel_start - instead of starting the kernel,
