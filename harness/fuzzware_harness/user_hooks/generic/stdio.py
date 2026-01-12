@@ -30,9 +30,16 @@ def putchar(uc):
 
 def printf(uc):
     # for now just print out the fmt string
+    from unicorn.arm_const import UC_ARM_REG_LR, UC_ARM_REG_PC
     ptr = uc.reg_read(UC_ARM_REG_R0)
     assert ptr != 0
     msg = uc.mem_read(ptr, 256)
+
+    # Debug: trace FREERTOS ASSERT calls
+    if b'FREERTOS ASSERT' in msg or b'ASSERT' in msg:
+        pc = uc.reg_read(UC_ARM_REG_PC)
+        lr = uc.reg_read(UC_ARM_REG_LR)
+        print(f"\n[DEBUG] ASSERT printf called! PC=0x{pc:08x} LR=0x{lr:08x}", file=sys.stderr, flush=True)
 
     if b'\0' in msg:
         msg = msg[:msg.find(b'\0')]
@@ -61,11 +68,17 @@ def printf(uc):
 
         if msg[cursor] == ord('s'):
             string_addr = args.pop()
-            s = uc.mem_read(string_addr, 1)
-            while s[-1] != ord("\0"):
-                string_addr += 1
-                s += uc.mem_read(string_addr, 1)
-            output += s[:-1]
+            if string_addr == 0:
+                output += b"(null)"
+            else:
+                try:
+                    s = uc.mem_read(string_addr, 1)
+                    while s[-1] != ord("\0"):
+                        string_addr += 1
+                        s += uc.mem_read(string_addr, 1)
+                    output += s[:-1]
+                except:
+                    output += b"(invalid)"
         elif msg[cursor] == ord('d'):
             val = args.pop()
             output += f"{val:d}".encode()

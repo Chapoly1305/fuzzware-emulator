@@ -41,12 +41,12 @@ def _log(msg):
     _emu_log(msg)
 
 def _log_uart_packet(direction, data, notes=""):
-    """Log UART packet to firmware.log"""
+    """Log UART packet to emulator.log"""
     if isinstance(data, (bytes, bytearray)):
         hex_data = data.hex()
     else:
         hex_data = str(data)
-    _fw_log(f"[UART {direction}] {hex_data}\n")
+    _emu_log(f"[UART_{direction}] {hex_data}\n")
 
 
 # ============================================================================
@@ -56,30 +56,23 @@ def _log_uart_packet(direction, data, notes=""):
 def xQueueGenericSend_intercept(uc):
     """
     Intercept FreeRTOS queue sends to capture UART responses.
-    When a response is queued, print it and optionally call TX directly.
+    When a response is queued, log it to emulator.log.
     """
-    import sys
-
     queue_handle = uc.reg_read(UC_ARM_REG_R0)
     item_ptr = uc.reg_read(UC_ARM_REG_R1)
-    ticks_to_wait = uc.reg_read(UC_ARM_REG_R2)
-    copy_position = uc.reg_read(UC_ARM_REG_R3)
-
-    print(f"[QUEUE_TX] xQueueGenericSend: queue={queue_handle:#x}, item={item_ptr:#x}", file=sys.stderr, flush=True)
 
     # Try to read the queued item
     if item_ptr != 0:
         try:
             # Read item data - structure unknown, dump first 64 bytes
             data = uc.mem_read(item_ptr, 64)
-            print(f"[QUEUE_TX] Queued data: {data.hex()}", file=sys.stderr, flush=True)
 
             # Check if this looks like a UART response (starts with AA 55 or contains it)
             if b'\xaa\x55' in data:
                 idx = data.index(b'\xaa\x55')
-                print(f"[QUEUE_TX] Found UART packet at offset {idx}: {data[idx:idx+32].hex()}", file=sys.stderr, flush=True)
+                _emu_log(f"[UART_TX] {data[idx:idx+32].hex()}\n")
         except Exception as e:
-            print(f"[QUEUE_TX] Error reading item: {e}", file=sys.stderr, flush=True)
+            pass
 
     # Return pdPASS (1)
     uc.reg_write(UC_ARM_REG_R0, 1)
@@ -89,61 +82,20 @@ def QueuePutWrapper_intercept(uc):
     """
     Intercept QueuePutWrapper to capture UART response data.
     This is called when command handlers queue a response.
-
-    Based on analysis: R0 points to a message structure, R1=0x68 might be cmd/type,
-    R2=0x5 might be payload length, R3 is callback.
     """
-    import sys
-
-    r0 = uc.reg_read(UC_ARM_REG_R0)
-    r1 = uc.reg_read(UC_ARM_REG_R1)
-    r2 = uc.reg_read(UC_ARM_REG_R2)
-    r3 = uc.reg_read(UC_ARM_REG_R3)
-    sp = uc.reg_read(UC_ARM_REG_SP)
-
-    print(f"[UART_RESPONSE] QueuePutWrapper: R0={r0:#x} R1={r1:#x} R2={r2:#x} R3={r3:#x} SP={sp:#x}", file=sys.stderr, flush=True)
-
-    # R1 might be command/event type (0x68 = 104 = 'h' or some event ID)
-    # R2 might be data length
-    # Let's dump the structure at R0 more carefully
-    if 0x20000000 <= r0 <= 0x20020000:
-        try:
-            # Read first 128 bytes of the structure
-            struct_data = uc.mem_read(r0, 128)
-            print(f"[UART_RESPONSE] Structure at R0:", file=sys.stderr, flush=True)
-            # Print in 16-byte rows
-            for i in range(0, 128, 16):
-                row = struct_data[i:i+16]
-                hex_str = ' '.join(f'{b:02x}' for b in row)
-                print(f"  +{i:02x}: {hex_str}", file=sys.stderr, flush=True)
-        except Exception as e:
-            print(f"[UART_RESPONSE] Error reading structure: {e}", file=sys.stderr, flush=True)
-
-    # Also check stack for pushed parameters
-    if 0x20000000 <= sp <= 0x20020000:
-        try:
-            stack_data = uc.mem_read(sp, 32)
-            print(f"[UART_RESPONSE] Stack: {stack_data.hex()}", file=sys.stderr, flush=True)
-        except:
-            pass
-
     # Check UART RX buffer area where response might be built
     try:
         uart_area = uc.mem_read(UART_RX_BUFFER_ADDR, 64)
         if b'\xaa\x55' in uart_area:
-            print(f"[UART_RESPONSE] UART buffer: {uart_area.hex()}", file=sys.stderr, flush=True)
-
-            # Log UART TX packet to file with formatting
             # Find the packet length
             aa55_idx = uart_area.find(b'\xaa\x55')
             if aa55_idx != -1 and aa55_idx + 3 < len(uart_area):
-                packet_len = uart_area[aa55_idx + 2] + 4  # length byte + magic(2) + len(1) + crc(2) - 1
+                packet_len = uart_area[aa55_idx + 2] + 4  # length + magic(2) + len(1) + crc
                 if aa55_idx + packet_len <= len(uart_area):
                     uart_packet = bytes(uart_area[aa55_idx:aa55_idx + packet_len])
-                    _log_uart_packet("TX", uart_packet, "Firmware response captured via QueuePutWrapper")
+                    _emu_log(f"[UART_TX] {uart_packet.hex()}\n")
     except Exception as e:
-        # Log errors but don't crash the emulator
-        print(f"[UART_TX_ERROR] Failed to log TX packet: {e}", file=sys.stderr, flush=True)
+        pass
 
     uc.reg_write(UC_ARM_REG_R0, 0)
 
@@ -204,54 +156,13 @@ def _wrap_fuzz_as_uart_packet(fuzz_payload, cmd=0x01, direction=UART_DIR_TO_SENS
 
 def UARTDRV_Receive(uc):
     """
-    Hook UARTDRV_Receive to inject fuzz input as UART protocol messages.
-
-    Ecode_t UARTDRV_Receive(UARTDRV_Handle_t handle, uint8_t *data, UARTDRV_Count_t count, UARTDRV_Callback_t callback)
-    R0 = handle, R1 = data buffer, R2 = count (max bytes to receive), R3 = callback
-
-    This hook:
-    1. Gets fuzz input bytes
-    2. Wraps them in UART protocol format
-    3. Writes to the provided buffer
-    4. Returns success
+    Hook UARTDRV_Receive - TEMPORARY: Return success without consuming fuzz.
+    This allows boot to complete before we inject fuzz.
     """
-    buffer_ptr = uc.reg_read(UC_ARM_REG_R1)
-    max_count = uc.reg_read(UC_ARM_REG_R2)
-
-    if buffer_ptr == 0 or max_count == 0:
-        uc.reg_write(UC_ARM_REG_R0, 0)  # Return success but no data
-        return
-
-    # Get fuzz input - request raw bytes for payload
-    # Limit payload to reasonable size
-    fuzz_size = min(max_count - 10, 64)  # Leave room for protocol overhead
-    if fuzz_size <= 0:
-        fuzz_size = 1
-
-    # Get fuzz bytes
-    fuzz_payload = get_fuzz(uc, fuzz_size)
-    if fuzz_payload is None or len(fuzz_payload) == 0:
-        # No more fuzz input
-        uc.reg_write(UC_ARM_REG_R0, 0)
-        return
-
-    # Wrap in UART protocol
-    # Use first fuzz byte as command if available, otherwise default
-    cmd = fuzz_payload[0] if len(fuzz_payload) > 0 else 0x01
-    payload = fuzz_payload[1:] if len(fuzz_payload) > 1 else b''
-
-    uart_packet = _wrap_fuzz_as_uart_packet(payload, cmd=cmd)
-
-    # Write to buffer (truncate if needed)
-    write_len = min(len(uart_packet), max_count)
-    uc.mem_write(buffer_ptr, uart_packet[:write_len])
-
-    _log(f"[UART] Injected {write_len} bytes: {uart_packet[:write_len].hex()}\n")
-
-    # Log UART RX packet to file with formatting
-    _log_uart_packet("RX", uart_packet[:write_len], "Fuzz input via UARTDRV_Receive")
-
-    # Return ECODE_EMDRV_UARTDRV_OK (0)
+    pc = uc.reg_read(UC_ARM_REG_PC)
+    lr = uc.reg_read(UC_ARM_REG_LR)
+    _emu_log(f"[UARTDRV_Receive] Called from LR=0x{lr:08x}\n")
+    # Return success but don't consume fuzz or inject data
     uc.reg_write(UC_ARM_REG_R0, 0)
 
 
@@ -881,27 +792,35 @@ _mainInit_seen = False
 
 
 _blocking_count = 0
+_fuzz_event_injected = False
 
 def trace_blocking_call(uc):
-    """Trace blocking FreeRTOS calls and return success to allow progress."""
+    """Trace blocking FreeRTOS calls and return timeout to allow progress."""
     global _blocking_count
     _blocking_count += 1
     pc = uc.reg_read(UC_ARM_REG_PC)
     lr = uc.reg_read(UC_ARM_REG_LR)
 
-    # For NVM3 caller (0x08098031), skip the whole NVM3 operation
-    # by returning to a higher-level caller
-    if (lr & 0xFFFFFFFE) == 0x08098030:
-        print(f"[BLOCKING #{_blocking_count}] NVM3 queue call - returning to higher caller", file=sys.stderr, flush=True)
-        _emu_log(f"[BLOCKING #{_blocking_count}] NVM3 queue at LR=0x{lr:08x} - skipping\n")
-        # Need to figure out where to return to - for now just return success
-        uc.reg_write(UC_ARM_REG_R0, 1)
-        return
-
-    if _blocking_count <= 10:  # Only print first 10
+    if _blocking_count <= 10:
         print(f"[BLOCKING #{_blocking_count}] PC=0x{pc:08x} LR=0x{lr:08x}", file=sys.stderr, flush=True)
     _emu_log(f"[BLOCKING #{_blocking_count}] PC=0x{pc:08x} LR=0x{lr:08x}\n")
-    uc.reg_write(UC_ARM_REG_R0, 1)  # Return pdTRUE/success
+
+    # Return pdFALSE (0) = timeout/no message, to avoid processing garbage
+    uc.reg_write(UC_ARM_REG_R0, 0)
+
+
+def osMessageQueueGet_fuzz(uc):
+    """
+    Hook osMessageQueueGet to inject fuzz data as application events.
+    TEMPORARY: Disabled fuzz consumption during boot to allow reaching AppTaskLoop.
+
+    osStatus_t osMessageQueueGet(osMessageQueueId_t mq_id, void *msg_ptr, uint8_t *msg_prio, uint32_t timeout)
+    R0 = mq_id, R1 = msg_ptr (output buffer), R2 = msg_prio (output), R3 = timeout
+
+    Returns: osOK (0) if message received, osErrorTimeout (-2) if timeout
+    """
+    # TEMPORARY: Always return timeout without consuming fuzz during boot
+    uc.reg_write(UC_ARM_REG_R0, 0xFFFFFFFE)  # osErrorTimeout = -2
 
 
 def debug_appinit_reached(uc):
@@ -914,6 +833,50 @@ def debug_appinit_reached(uc):
     # Force exit
     import os
     os._exit(0)
+
+
+_app_user_init_seen = False
+
+def println_with_uart_redirect(uc):
+    """
+    println hook that detects applicationUserInit and redirects to UART fuzzing.
+    This bypasses FreeRTOS entirely and goes straight to UART parsing.
+    """
+    from unicorn.arm_const import UC_ARM_REG_R0, UC_ARM_REG_LR, UC_ARM_REG_PC
+    import time
+    global _app_user_init_seen
+
+    # Read the string pointer from R0
+    str_ptr = uc.reg_read(UC_ARM_REG_R0)
+    lr = uc.reg_read(UC_ARM_REG_LR)
+    pc = uc.reg_read(UC_ARM_REG_PC)
+
+    if str_ptr == 0:
+        return
+
+    try:
+        # Read string up to 100 chars
+        raw_bytes = uc.mem_read(str_ptr, 100)
+        null_idx = raw_bytes.find(b'\x00')
+        if null_idx != -1:
+            raw_bytes = raw_bytes[:null_idx]
+        msg = raw_bytes.decode('utf-8', errors='replace')
+    except:
+        msg = "<error reading string>"
+
+    # Log with timestamp
+    timestamp = time.strftime('%Y-%m-%d, %H:%M:%S', time.localtime())
+    _fw_log(f"[{timestamp}, 0x{pc:08x}] {msg}\n")
+
+    # Check for applicationUserInit - this is the last safe point before FreeRTOS ASSERT
+    if "applicationUserInit" in msg and not _app_user_init_seen:
+        _app_user_init_seen = True
+        _emu_log(f"[PRINTLN] Detected applicationUserInit - redirecting to UART fuzzing\n")
+        print(f"[UART_REDIRECT] Detected applicationUserInit - redirecting to UART fuzzing", file=sys.stderr, flush=True)
+
+        # Redirect to UART fuzzing - this bypasses FreeRTOS
+        start_uart_fuzzing(uc)
+        return True  # Prevent return to normal code
 
 
 def println_mainInit_redirect(uc):
@@ -1134,6 +1097,80 @@ def start_uart_fuzzing(uc):
 # Trace hooks for debugging FreeRTOS boot sequence
 # ============================================================================
 
+def bypass_stackoverflow_hook(uc):
+    """Bypass vApplicationStackOverflowHook - prevent ASSERT message and loop."""
+    pc = uc.reg_read(UC_ARM_REG_PC)
+    lr = uc.reg_read(UC_ARM_REG_LR)
+    print(f"[STACKOVERFLOW_BYPASS] Hook triggered at PC=0x{pc:08x} LR=0x{lr:08x}", file=sys.stderr, flush=True)
+    _emu_log(f"[STACKOVERFLOW_BYPASS] vApplicationStackOverflowHook bypassed, caller=0x{lr:08x}\n")
+    # Return immediately - don't let the function execute
+    uc.reg_write(UC_ARM_REG_R0, 0)
+
+
+_assert_count = 0
+
+def force_return_from_assert_loop(uc):
+    """
+    Force return from ASSERT infinite loop by setting PC to LR.
+    This breaks out of the while(1){} loop after ASSERT message.
+
+    After a few assertions, exit cleanly since the system is broken.
+    """
+    global _assert_count
+    _assert_count += 1
+
+    pc = uc.reg_read(UC_ARM_REG_PC)
+    lr = uc.reg_read(UC_ARM_REG_LR)
+    sp = uc.reg_read(UC_ARM_REG_SP)
+
+    # Log only first few
+    if _assert_count <= 3:
+        _emu_log(f"[ASSERT_LOOP_BREAK #{_assert_count}] Breaking infinite loop at PC=0x{pc:08x}, LR=0x{lr:08x}\n")
+        print(f"[ASSERT_LOOP_BREAK] Breaking out of ASSERT infinite loop at 0x{pc:08x}", file=sys.stderr, flush=True)
+
+    # After too many assertions, system is broken - jump to clean exit
+    if _assert_count > 2:
+        # Redirect to an infinite loop that will hit the instruction limit cleanly
+        # Write a clean exit loop to RAM
+        EXIT_LOOP_ADDR = 0x20018100
+        try:
+            # Write "b ." (infinite loop) in Thumb
+            uc.mem_write(EXIT_LOOP_ADDR, b'\xfe\xe7')
+            uc.reg_write(UC_ARM_REG_PC, EXIT_LOOP_ADDR | 1)
+            _emu_log(f"[ASSERT_LOOP_BREAK] Too many asserts ({_assert_count}), exiting via loop\n")
+        except:
+            pass
+        return False
+
+    # For first assertion, try to find a valid return address further up the stack
+    # Skip addresses in the 0x08010xxx range (FreeRTOS error handlers)
+    try:
+        for offset in range(0, 128, 4):
+            ret_addr = int.from_bytes(uc.mem_read(sp + offset, 4), 'little')
+            # Find ROM address that's NOT in FreeRTOS error handler range
+            if 0x08000000 <= ret_addr <= 0x080FFFFF:
+                # Skip if in FreeRTOS error handler range (0x08010000-0x08011000) or ASSERT range
+                if 0x08010000 <= ret_addr <= 0x08011000:
+                    continue
+                if 0x08021000 <= ret_addr <= 0x08022000:
+                    continue
+                _emu_log(f"[ASSERT_LOOP_BREAK] Found valid return at SP+{offset}: 0x{ret_addr:08x}\n")
+                uc.reg_write(UC_ARM_REG_PC, ret_addr | 1)
+                uc.reg_write(UC_ARM_REG_R0, 0)
+                return False
+    except:
+        pass
+
+    # Fallback: just exit cleanly
+    EXIT_LOOP_ADDR = 0x20018100
+    try:
+        uc.mem_write(EXIT_LOOP_ADDR, b'\xfe\xe7')
+        uc.reg_write(UC_ARM_REG_PC, EXIT_LOOP_ADDR | 1)
+    except:
+        pass
+    return False
+
+
 def trace_vStartFirstTask(uc):
     """Trace hook for vStartFirstTask - this starts the first FreeRTOS task."""
     pc = uc.reg_read(UC_ARM_REG_PC)
@@ -1206,6 +1243,163 @@ def sl_sleeptimer_get_timer_frequency_high(uc):
     Some firmware uses tick rates > 32768 Hz, so return 1MHz.
     """
     uc.reg_write(UC_ARM_REG_R0, 1000000)  # 1MHz
+
+
+# ============================================================================
+# NVM3 Bypass Hooks - Skip NVM3 and return appropriate responses to Matter
+# ============================================================================
+
+# NVM3 Error Codes - Simple integer values (NOT full ECODE format)
+# These are the raw values returned by nvm3_* functions
+NVM3_OK = 0              # Success
+NVM3_ERR_KEY_NOT_FOUND = 45   # Key not found (objGroupDeleted)
+NVM3_ERR_NOT_OPENED = 17      # NVM3 not opened
+NVM3_ERR_NULL_HANDLE = 33     # NULL handle
+NVM3_ERR_KEY_INVALID = 41     # Invalid key (>= 0x100000)
+
+
+def nvm3_readData_bypass(uc):
+    """
+    Bypass nvm3_readData - return "key not found" error.
+
+    Ecode_t nvm3_readData(nvm3_Handle_t *h, nvm3_ObjectKey_t key, void *value, size_t len)
+    R0 = handle, R1 = key, R2 = value buffer, R3 = len
+    Returns: 45 (key not found)
+    """
+    key = uc.reg_read(UC_ARM_REG_R1)
+    _emu_log(f"[NVM3_BYPASS] nvm3_readData(key=0x{key:05x}) -> KEY_NOT_FOUND(45)\n")
+    uc.reg_write(UC_ARM_REG_R0, NVM3_ERR_KEY_NOT_FOUND)
+
+
+def nvm3_readPartialData_bypass(uc):
+    """
+    Bypass nvm3_readPartialData - return "key not found" error.
+    """
+    key = uc.reg_read(UC_ARM_REG_R1)
+    _emu_log(f"[NVM3_BYPASS] nvm3_readPartialData(key=0x{key:05x}) -> KEY_NOT_FOUND(45)\n")
+    uc.reg_write(UC_ARM_REG_R0, NVM3_ERR_KEY_NOT_FOUND)
+
+
+def nvm3_readCounter_bypass(uc):
+    """
+    Bypass nvm3_readCounter - return "key not found" error.
+    """
+    key = uc.reg_read(UC_ARM_REG_R1)
+    _emu_log(f"[NVM3_BYPASS] nvm3_readCounter(key=0x{key:05x}) -> KEY_NOT_FOUND(45)\n")
+    uc.reg_write(UC_ARM_REG_R0, NVM3_ERR_KEY_NOT_FOUND)
+
+
+def nvm3_writeData_bypass(uc):
+    """
+    Bypass nvm3_writeData - return success without writing.
+    """
+    key = uc.reg_read(UC_ARM_REG_R1)
+    _emu_log(f"[NVM3_BYPASS] nvm3_writeData(key=0x{key:05x}) -> OK(0)\n")
+    uc.reg_write(UC_ARM_REG_R0, NVM3_OK)
+
+
+def nvm3_writeCounter_bypass(uc):
+    """
+    Bypass nvm3_writeCounter - return success.
+    """
+    key = uc.reg_read(UC_ARM_REG_R1)
+    _emu_log(f"[NVM3_BYPASS] nvm3_writeCounter(key=0x{key:05x}) -> OK(0)\n")
+    uc.reg_write(UC_ARM_REG_R0, NVM3_OK)
+
+
+def nvm3_incrementCounter_bypass(uc):
+    """
+    Bypass nvm3_incrementCounter - return success.
+    """
+    key = uc.reg_read(UC_ARM_REG_R1)
+    _emu_log(f"[NVM3_BYPASS] nvm3_incrementCounter(key=0x{key:05x}) -> OK(0)\n")
+    uc.reg_write(UC_ARM_REG_R0, NVM3_OK)
+
+
+def nvm3_deleteObject_bypass(uc):
+    """
+    Bypass nvm3_deleteObject - return success.
+    """
+    key = uc.reg_read(UC_ARM_REG_R1)
+    _emu_log(f"[NVM3_BYPASS] nvm3_deleteObject(key=0x{key:05x}) -> OK(0)\n")
+    uc.reg_write(UC_ARM_REG_R0, NVM3_OK)
+
+
+def nvm3_getObjectInfo_bypass(uc):
+    """
+    Bypass nvm3_getObjectInfo - return "key not found" error.
+    """
+    key = uc.reg_read(UC_ARM_REG_R1)
+    _emu_log(f"[NVM3_BYPASS] nvm3_getObjectInfo(key=0x{key:05x}) -> KEY_NOT_FOUND(45)\n")
+    uc.reg_write(UC_ARM_REG_R0, NVM3_ERR_KEY_NOT_FOUND)
+
+
+def nvm3_enumObjects_bypass(uc):
+    """
+    Bypass nvm3_enumObjects - return 0 (no objects found).
+    """
+    key_min = uc.reg_read(UC_ARM_REG_R3)
+    _emu_log(f"[NVM3_BYPASS] nvm3_enumObjects(keyMin=0x{key_min:05x}) -> 0 objects\n")
+    uc.reg_write(UC_ARM_REG_R0, 0)
+
+
+def nvm3_enumDeletedObjects_bypass(uc):
+    """
+    Bypass nvm3_enumDeletedObjects - return 0 (no deleted objects).
+    """
+    _emu_log(f"[NVM3_BYPASS] nvm3_enumDeletedObjects() -> 0 objects\n")
+    uc.reg_write(UC_ARM_REG_R0, 0)
+
+
+def nvm3_open_bypass(uc):
+    """
+    Bypass nvm3_open - return success and mark handle as opened.
+
+    This is CRITICAL: nvm3_open contains blocking xQueueReceive calls.
+    We skip the actual initialization but set hasBeenOpened = true.
+
+    sl_status_t nvm3_open(nvm3_Handle_t *h, const nvm3_Init_t *i)
+    R0 = handle pointer, R1 = init struct pointer
+    """
+    handle_ptr = uc.reg_read(UC_ARM_REG_R0)
+    _emu_log(f"[NVM3_BYPASS] nvm3_open(handle=0x{handle_ptr:08x}) -> OK(0)\n")
+
+    # Set hasBeenOpened flag (offset 0x34 in nvm3_Handle_t)
+    # This prevents "NVM3 not opened" errors (error code 17)
+    if handle_ptr and handle_ptr >= 0x20000000:
+        try:
+            uc.mem_write(handle_ptr + 0x34, b'\x01')
+            _emu_log(f"[NVM3_BYPASS] Set hasBeenOpened=1 at 0x{handle_ptr + 0x34:08x}\n")
+        except:
+            pass
+
+    uc.reg_write(UC_ARM_REG_R0, NVM3_OK)
+
+
+def nvm3_initDefault_bypass(uc):
+    """
+    Bypass nvm3_initDefault - return success but don't actually initialize.
+    nvm3_initDefault calls nvm3_open internally, so we skip both.
+    """
+    _emu_log(f"[NVM3_BYPASS] nvm3_initDefault() -> OK(0)\n")
+    uc.reg_write(UC_ARM_REG_R0, NVM3_OK)
+
+
+def nvm3_close_bypass(uc):
+    """
+    Bypass nvm3_close - return success.
+    """
+    _emu_log(f"[NVM3_BYPASS] nvm3_close() -> OK(0)\n")
+    uc.reg_write(UC_ARM_REG_R0, NVM3_OK)
+
+
+def nvm3_async_operation_bypass(uc):
+    """
+    Bypass the async NVM3 operation that uses FreeRTOS queues.
+    """
+    lr = uc.reg_read(UC_ARM_REG_LR)
+    _emu_log(f"[NVM3_BYPASS] Async NVM3 operation skipped (caller=0x{lr:08x})\n")
+    uc.reg_write(UC_ARM_REG_R0, NVM3_OK)
 
 
 # ============================================================================
@@ -1309,3 +1503,78 @@ def nvm3_halFlashGetInfo(uc):
 
     # Return ECODE_NVM3_OK (0)
     uc.reg_write(UC_ARM_REG_R0, 0)
+
+
+# ============================================================================
+# UART TX Capture Hooks - Capture firmware responses
+# ============================================================================
+
+def UART_BuildAndSendTx(uc):
+    """
+    Hook UART_BuildAndSendTx to capture TX packets.
+    This is the main function that builds and sends UART responses.
+
+    void UART_BuildAndSendTx(uint8_t cmd, uint8_t *data, uint16_t len)
+    R0 = cmd, R1 = data buffer pointer, R2 = length
+    """
+    cmd = uc.reg_read(UC_ARM_REG_R0)
+    data_ptr = uc.reg_read(UC_ARM_REG_R1)
+    length = uc.reg_read(UC_ARM_REG_R2)
+
+    _emu_log(f"[UART_TX] UART_BuildAndSendTx: cmd=0x{cmd:02x}, data_ptr=0x{data_ptr:08x}, len={length}\n")
+
+    if data_ptr != 0 and length > 0 and length < 512:
+        try:
+            data = uc.mem_read(data_ptr, length)
+            _emu_log(f"[UART_TX] Data: {data.hex()}\n")
+        except Exception as e:
+            _emu_log(f"[UART_TX] Error reading data: {e}\n")
+
+    # Continue execution - don't skip the function
+    return False
+
+
+def UART_DoTransmit(uc):
+    """
+    Hook UART_DoTransmit to capture low-level TX.
+    This function handles the actual UART transmission.
+
+    void UART_DoTransmit(uint8_t *buffer, uint16_t len)
+    R0 = buffer pointer, R1 = length
+    """
+    buffer_ptr = uc.reg_read(UC_ARM_REG_R0)
+    length = uc.reg_read(UC_ARM_REG_R1)
+
+    _emu_log(f"[UART_TX] UART_DoTransmit: buffer=0x{buffer_ptr:08x}, len={length}\n")
+
+    if buffer_ptr != 0 and length > 0 and length < 512:
+        try:
+            data = uc.mem_read(buffer_ptr, length)
+            _emu_log(f"[UART_TX] TX packet: {data.hex()}\n")
+        except Exception as e:
+            _emu_log(f"[UART_TX] Error reading buffer: {e}\n")
+
+    # Continue execution
+    return False
+
+
+def TxCmd_Status(uc):
+    """
+    Hook TxCmd_Status to capture status responses.
+    void TxCmd_Status(void)
+    """
+    _emu_log("[UART_TX] TxCmd_Status - sending status response\n")
+    # Continue execution
+    return False
+
+
+def EUSART_Tx(uc):
+    """
+    Hook low-level EUSART_Tx to capture individual bytes being sent.
+    void EUSART_Tx(EUSART_TypeDef *eusart, uint8_t data)
+    R0 = eusart peripheral, R1 = byte to send
+    """
+    byte_val = uc.reg_read(UC_ARM_REG_R1) & 0xFF
+    _emu_log(f"[EUSART_TX] 0x{byte_val:02x}\n")
+    # Continue - let the real function execute
+    return False
