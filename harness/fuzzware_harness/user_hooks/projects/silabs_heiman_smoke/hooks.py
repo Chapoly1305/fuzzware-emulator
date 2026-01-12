@@ -988,6 +988,10 @@ def start_uart_fuzzing(uc):
     """
     import sys
     import ctypes
+    global _packet_count
+
+    # Reset packet counter for this fuzzing session
+    _packet_count = 0
 
     print("[UART_FUZZ] Hook entry", file=sys.stderr, flush=True)
     _log("[UART_FUZZ] Intercepted sl_kernel_start, redirecting to UART parsing\n")
@@ -1019,8 +1023,10 @@ def start_uart_fuzzing(uc):
             # Read the first byte
             first_byte = (ctypes.c_char * 1).from_address(ptr_addr).raw
 
-            # Get remaining bytes (up to 64 total)
-            bytes_to_get = min(remaining_after, 63)  # Already got 1
+            # Get remaining bytes - limit to 15 per packet for multi-packet fuzzing
+            # This allows ~4 packets from a 64-byte fuzz input
+            PACKET_CHUNK_SIZE = 15  # 1 cmd byte + up to 14 payload bytes
+            bytes_to_get = min(remaining_after, PACKET_CHUNK_SIZE - 1)  # Already got 1
             if bytes_to_get > 0:
                 ptr_addr2 = native.native_lib.get_fuzz_ptr(uc_handle, bytes_to_get)
                 if ptr_addr2 and ptr_addr2 != 0:
@@ -1091,6 +1097,98 @@ def start_uart_fuzzing(uc):
 
     # Return False to let execution continue at new PC (not the patched bx lr)
     return False
+
+
+# ============================================================================
+# Persistent Fuzzing Loop Handler
+# ============================================================================
+
+_packet_count = 0
+
+def uart_persistent_loop(uc):
+    """
+    Persistent loop handler for UART fuzzing.
+
+    This hook is triggered when UART_ParsePackets returns (at LOOP_ADDR).
+    It checks for remaining fuzz input and either:
+    - Processes another packet if fuzz remains
+    - Exits cleanly if fuzz is exhausted
+
+    This avoids the snapshot/restore overhead for multi-packet fuzzing.
+    """
+    import ctypes
+    from fuzzware_harness import native
+    global _packet_count
+
+    _packet_count += 1
+
+    # Check remaining fuzz input
+    remaining = native.fuzz_remaining()
+
+    if remaining == 0:
+        # No more fuzz - exit cleanly
+        _emu_log(f"[UART_LOOP] Processed {_packet_count} packets, fuzz exhausted - exiting\n")
+        # Return to a NOP sled or just let execution stop
+        # Setting PC to 0 will trigger clean exit
+        uc.reg_write(UC_ARM_REG_PC, 0)
+        return True
+
+    _emu_log(f"[UART_LOOP] Packet {_packet_count} done, {remaining} fuzz bytes remaining - processing next\n")
+
+    try:
+        uc_handle = uc._uch
+
+        # Get next chunk of fuzz - limit to 15 bytes per packet
+        PACKET_CHUNK_SIZE = 15  # 1 cmd byte + up to 14 payload bytes
+        bytes_to_get = min(remaining, PACKET_CHUNK_SIZE)
+        ptr_addr = native.native_lib.get_fuzz_ptr(uc_handle, bytes_to_get)
+
+        if ptr_addr is None or ptr_addr == 0:
+            _emu_log("[UART_LOOP] Failed to get fuzz - exiting\n")
+            uc.reg_write(UC_ARM_REG_PC, 0)
+            return True
+
+        raw_fuzz = (ctypes.c_char * bytes_to_get).from_address(ptr_addr).raw
+
+        # Build next UART packet
+        cmd = raw_fuzz[0] if len(raw_fuzz) > 0 else 0x01
+        payload = raw_fuzz[1:] if len(raw_fuzz) > 1 else b''
+
+        MAX_PAYLOAD = 250
+        if len(payload) > MAX_PAYLOAD:
+            payload = payload[:MAX_PAYLOAD]
+
+        seq = _packet_count & 0xFF
+        direction = 0x01
+        header = bytes([UART_DEV_TYPE, UART_PROTO_VER, seq, direction, cmd])
+        packet_len = len(header) + len(payload)
+        packet_body = bytes([packet_len]) + header + payload
+
+        crc = 0
+        for b in packet_body:
+            crc ^= b
+
+        uart_packet = b'\xAA\x55' + packet_body + bytes([crc])
+
+        # Write to buffer
+        uc.mem_write(FUZZ_BUFFER_ADDR, uart_packet)
+
+        _emu_log(f"[UART_LOOP] Packet {_packet_count + 1}: cmd=0x{cmd:02x}, {len(uart_packet)} bytes\n")
+        _log_uart_packet("RX", uart_packet)
+
+        # Set up call to UART_ParsePackets again
+        LOOP_ADDR = 0x20018000
+        uc.reg_write(UC_ARM_REG_R0, FUZZ_BUFFER_ADDR)
+        uc.reg_write(UC_ARM_REG_R1, len(uart_packet))
+        uc.reg_write(UC_ARM_REG_LR, LOOP_ADDR | 1)
+        uc.reg_write(UC_ARM_REG_PC, 0x0800803c | 1)
+
+        return False  # Continue execution at UART_ParsePackets
+
+    except Exception as e:
+        _emu_log(f"[UART_LOOP] Error: {e} - exiting\n")
+        uc.reg_write(UC_ARM_REG_PC, 0)
+        return True
 
 
 # ============================================================================
