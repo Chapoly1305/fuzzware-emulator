@@ -1,84 +1,52 @@
 """
 Heiman Smoke Detector - Project-Specific Hooks
 
-Custom hooks for Heiman Smoke Detector firmware (Silicon Labs EFR32MG1x Zigbee).
-This module provides device-specific UART protocol handling, radio hardware bypass,
-and firmware-specific hooks for the Heiman smoke detector.
-
-Features:
-- UART protocol fuzzing with custom packet format (0xAA55 magic, CRC)
-- Radio/RAIL/Zigbee hardware bypass hooks
-- Crypto, flash, and GPIO hooks for EFR32MG1x
-- Interrupt injection and queue interception
+Log files (shared with silabs.py):
+- /tmp/firmware.log  - Firmware output (UART TX/RX, prints)
+- /tmp/emulator.log  - Emulator debug (hooks, NVM3 traces)
 """
 import sys
 import os
 from unicorn.arm_const import UC_ARM_REG_R0, UC_ARM_REG_R1, UC_ARM_REG_R2, UC_ARM_REG_R3, UC_ARM_REG_LR, UC_ARM_REG_PC, UC_ARM_REG_SP
 
-# Import fuzz input functions (note: three dots for projects subdirectory)
 from ...fuzz import get_fuzz
 
-# Log file paths
-LOG_FILE_PATH = os.environ.get('FUZZWARE_LOG_FILE', '/tmp/fuzzware_heiman.log')
-UART_LOG_FILE = os.environ.get('UART_LOG_FILE', '/tmp/uart_txrx.log')
-_log_file = None
-_uart_log_file = None
-_log_enabled = os.environ.get('FUZZWARE_LOG_LEVEL', 'WARN').upper() in ('DEBUG', 'INFO')
+# =============================================================================
+# Simple Two-File Logging (same as silabs.py)
+# =============================================================================
+FIRMWARE_LOG = os.environ.get('FIRMWARE_LOG', '/tmp/firmware.log')
+EMULATOR_LOG = os.environ.get('EMULATOR_LOG', '/tmp/emulator.log')
 
-def _get_log_file():
-    """Get or create the log file handle"""
-    global _log_file
-    if _log_file is None:
-        _log_file = open(LOG_FILE_PATH, 'a')
-    return _log_file
+_firmware_log_file = None
+_emulator_log_file = None
 
+def _fw_log(msg):
+    """Write to firmware.log"""
+    global _firmware_log_file
+    if _firmware_log_file is None:
+        _firmware_log_file = open(FIRMWARE_LOG, 'a')
+    _firmware_log_file.write(msg)
+    _firmware_log_file.flush()
+
+def _emu_log(msg):
+    """Write to emulator.log"""
+    global _emulator_log_file
+    if _emulator_log_file is None:
+        _emulator_log_file = open(EMULATOR_LOG, 'a')
+    _emulator_log_file.write(msg)
+    _emulator_log_file.flush()
+
+# Legacy alias
 def _log(msg):
-    """Write message to log file if enabled"""
-    if _log_enabled:
-        f = _get_log_file()
-        f.write(msg)
-        f.flush()
-
-
-def _get_uart_log_file():
-    """Get or create the UART log file handle"""
-    global _uart_log_file
-    if _uart_log_file is None:
-        _uart_log_file = open(UART_LOG_FILE, 'a')
-        # Write CSV header if file is new/empty
-        try:
-            if os.path.getsize(UART_LOG_FILE) == 0:
-                _uart_log_file.write("timestamp,direction,hex\n")
-        except:
-            _uart_log_file.write("timestamp,direction,hex\n")
-    return _uart_log_file
-
+    _emu_log(msg)
 
 def _log_uart_packet(direction, data, notes=""):
-    """
-    Log UART packet to CSV file
-
-    Args:
-        direction: "RX" or "TX" (from firmware perspective)
-        data: bytes, bytearray, or hex string
-        notes: ignored (for compatibility)
-    """
-    import time
-
-    f = _get_uart_log_file()
-    timestamp = f"{time.time():.3f}"
-
-    # Convert to hex string without spaces
+    """Log UART packet to firmware.log"""
     if isinstance(data, (bytes, bytearray)):
         hex_data = data.hex()
-    elif isinstance(data, str):
-        hex_data = data.replace(" ", "").replace("0x", "")
     else:
-        hex_data = ""
-
-    # Write CSV line: timestamp,direction,hex
-    f.write(f"{timestamp},{direction},{hex_data}\n")
-    f.flush()
+        hex_data = str(data)
+    _fw_log(f"[UART {direction}] {hex_data}\n")
 
 
 # ============================================================================
@@ -879,50 +847,91 @@ _discovery_triggered = False
 
 def trigger_fuzz_consumption(uc):
     """
-    Early fuzz consumption trigger for discovery phase.
-
-    Uses a static flag to ensure we only consume fuzz once (during discovery).
-    After the first call, this hook becomes a no-op.
-
-    IMPORTANT: This hook MUST be configured with do_return: false
-    to allow normal execution to continue after triggering consumption.
+    Early fuzz consumption trigger - consumes fuzz bytes when called.
+    Use with do_return: false to continue normal execution after consumption.
     """
-    global _discovery_triggered
     import ctypes
     from fuzzware_harness import native
 
-    # Skip if already triggered (we're in normal execution, not discovery)
-    if _discovery_triggered:
-        print("[FUZZ] Skipping - discovery already completed", file=sys.stderr, flush=True)
-        return
+    print("[FUZZ] trigger_fuzz_consumption CALLED!", file=sys.stderr, flush=True)
 
     try:
         uc_handle = uc._uch
-        print("[DISCOVERY] Attempting fuzz consumption for discovery phase", file=sys.stderr, flush=True)
 
-        # Call get_fuzz_ptr() which will either:
-        # - In discovery child: detect is_discovery_child=1 and exit with tick count
-        # - In normal execution: return a fuzz byte
-        ptr_addr = native.native_lib.get_fuzz_ptr(uc_handle, 1)
-
-        if ptr_addr and ptr_addr != 0:
-            # We got a fuzz byte - this means we're in normal execution (not discovery child)
-            # Mark as triggered so we skip on subsequent calls
-            _discovery_triggered = True
-            byte_val = (ctypes.c_char * 1).from_address(ptr_addr).raw
-            print(f"[DISCOVERY] Consumed first byte: {byte_val.hex()} - will skip future calls",
-                  file=sys.stderr, flush=True)
-        else:
-            print("[DISCOVERY] No fuzz available", file=sys.stderr, flush=True)
+        # Get all remaining fuzz bytes (triggers fuzz consumption tracking)
+        remaining = native.fuzz_remaining()
+        if remaining > 0:
+            # Consume up to 64 bytes of fuzz
+            bytes_to_get = min(remaining, 64)
+            ptr_addr = native.native_lib.get_fuzz_ptr(uc_handle, bytes_to_get)
+            if ptr_addr and ptr_addr != 0:
+                fuzz_data = (ctypes.c_char * bytes_to_get).from_address(ptr_addr).raw
+                _emu_log(f"[FUZZ_CONSUME] mainInit consumed {len(fuzz_data)} bytes: {fuzz_data[:16].hex()}...\n")
+                print(f"[FUZZ] Consumed {len(fuzz_data)} bytes at mainInit", file=sys.stderr, flush=True)
 
     except Exception as e:
-        print(f"[FUZZ] Error in trigger: {e}", file=sys.stderr, flush=True)
+        print(f"[FUZZ] Error: {e}", file=sys.stderr, flush=True)
 
-    # Return normally - do NOT modify execution flow
+    # Continue normal execution
 
 
 _boot_count = 0
 _trace_counter = 0
+_mainInit_seen = False
+
+
+def debug_appinit_reached(uc):
+    """Debug hook - print and exit when AppInit is reached."""
+    pc = uc.reg_read(UC_ARM_REG_PC)
+    lr = uc.reg_read(UC_ARM_REG_LR)
+    print(f"[DEBUG] *** AppInit reached! PC=0x{pc:08x} LR=0x{lr:08x} ***", file=sys.stderr, flush=True)
+    print(f"[DEBUG] Boot sequence successful - exiting", file=sys.stderr, flush=True)
+    _emu_log(f"[AppInit] Reached SilabsMatterConfig::AppInit at 0x{pc:08x}\n")
+    # Force exit
+    import os
+    os._exit(0)
+
+
+def println_mainInit_redirect(uc):
+    """
+    println hook that detects mainInit and redirects to UART fuzzing.
+    Call this instead of the generic firmware_printf.
+    """
+    from unicorn.arm_const import UC_ARM_REG_R0, UC_ARM_REG_LR, UC_ARM_REG_PC
+    import time
+    global _mainInit_seen
+
+    # Read the string pointer from R0
+    str_ptr = uc.reg_read(UC_ARM_REG_R0)
+    lr = uc.reg_read(UC_ARM_REG_LR)
+
+    if str_ptr == 0:
+        return
+
+    try:
+        # Read string up to 100 chars
+        raw_bytes = uc.mem_read(str_ptr, 100)
+        null_idx = raw_bytes.find(b'\x00')
+        if null_idx != -1:
+            raw_bytes = raw_bytes[:null_idx]
+        msg = raw_bytes.decode('utf-8', errors='replace')
+    except:
+        msg = "<error reading string>"
+
+    # Log with timestamp
+    timestamp = time.strftime('%Y-%m-%d, %H:%M:%S', time.localtime())
+    pc = uc.reg_read(UC_ARM_REG_PC)
+    _fw_log(f"[{timestamp}, 0x{pc:08x}] {msg}\n")
+
+    # Check for mainInit
+    if "mainInit" in msg and not _mainInit_seen:
+        _mainInit_seen = True
+        _emu_log(f"[PRINTLN] Detected mainInit - redirecting to UART fuzzing\n")
+        print(f"[PRINTLN] Detected mainInit - will redirect to UART fuzzing", file=sys.stderr, flush=True)
+
+        # Redirect to UART fuzzing
+        start_uart_fuzzing(uc)
+        return True  # Skip return (start_uart_fuzzing sets PC)
 
 def debug_trace(uc):
     """Generic trace hook."""
@@ -1173,3 +1182,106 @@ def sl_sleeptimer_get_timer_frequency_high(uc):
     Some firmware uses tick rates > 32768 Hz, so return 1MHz.
     """
     uc.reg_write(UC_ARM_REG_R0, 1000000)  # 1MHz
+
+
+# ============================================================================
+# NVM3 Flash Read Tracing - logs to emulator.log
+# ============================================================================
+
+def nvm3_halFlashReadWords_trace(uc):
+    """Trace NVM3 flash reads. Use with do_return: false."""
+    nvm_addr = uc.reg_read(UC_ARM_REG_R0)
+    dst_addr = uc.reg_read(UC_ARM_REG_R1)
+    word_count = uc.reg_read(UC_ARM_REG_R2)
+    lr = uc.reg_read(UC_ARM_REG_LR)
+    _emu_log(f"[NVM3_READ] addr=0x{nvm_addr:08x} dst=0x{dst_addr:08x} words={word_count} caller=0x{lr:08x}\n")
+
+
+def nvm3_enumObjects_trace(uc):
+    """Trace NVM3 object enumeration. Use with do_return: false."""
+    key_min = uc.reg_read(UC_ARM_REG_R3)
+    sp = uc.reg_read(UC_ARM_REG_SP)
+    try:
+        key_max = int.from_bytes(uc.mem_read(sp, 4), 'little')
+    except:
+        key_max = 0
+    lr = uc.reg_read(UC_ARM_REG_LR)
+    _emu_log(f"[NVM3_ENUM] keyMin=0x{key_min:05x} keyMax=0x{key_max:05x} caller=0x{lr:08x}\n")
+
+
+def nvm3_open_trace(uc):
+    """Trace NVM3 open. Use with do_return: false."""
+    init_ptr = uc.reg_read(UC_ARM_REG_R1)
+    lr = uc.reg_read(UC_ARM_REG_LR)
+    flash_addr = 0
+    try:
+        init_data = uc.mem_read(init_ptr, 16)
+        flash_addr = int.from_bytes(init_data[0:4], 'little')
+    except:
+        pass
+    _emu_log(f"[NVM3_OPEN] flash_addr=0x{flash_addr:08x} caller=0x{lr:08x}\n")
+
+
+def nvm3_halFlashGetInfo(uc):
+    """
+    Hook nvm3_halFlashGetInfo to provide correct MG24 flash parameters.
+
+    Ecode_t nvm3_halFlashGetInfo(nvm3_HalFlashInfo_t *info)
+    R0 = pointer to flash info structure to fill
+
+    Structure (from GSDK):
+    typedef struct {
+        uint16_t deviceFamily;    // Device family ID
+        uint8_t  writeSize;       // Write granularity (bytes)
+        uint8_t  memoryMapped;    // Non-zero if memory mapped
+        size_t   pageSize;        // Flash page size (bytes)
+        uint32_t systemPartStart; // Start of system partition
+        uint32_t systemPartEnd;   // End of system partition
+        uint32_t userPartStart;   // Start of user partition
+        uint32_t userPartEnd;     // End of user partition
+    } nvm3_HalFlashInfo_t;
+
+    For MG24:
+    - Page size: 8KB (0x2000)
+    - Write size: 4 bytes
+    - Memory mapped: 1 (yes)
+    """
+    import struct
+
+    info_ptr = uc.reg_read(UC_ARM_REG_R0)
+
+    # MG24 flash info
+    device_family = 0x3C  # EFR32MG24 family
+    write_size = 4        # 4-byte write granularity
+    memory_mapped = 1     # Memory mapped flash
+    page_size = 0x2000    # 8KB pages
+
+    # System partition (bootloader area)
+    system_part_start = 0x08000000
+    system_part_end = 0x08006000
+
+    # User partition (application + NVM3)
+    user_part_start = 0x08006000
+    user_part_end = 0x08180000  # 1.5MB flash
+
+    # Pack the structure
+    # uint16_t deviceFamily, uint8_t writeSize, uint8_t memoryMapped,
+    # size_t pageSize (4 bytes on ARM), 4x uint32_t
+    flash_info = struct.pack('<HBBIIIII',
+        device_family,
+        write_size,
+        memory_mapped,
+        page_size,
+        system_part_start,
+        system_part_end,
+        user_part_start,
+        user_part_end
+    )
+
+    # Write to the info structure
+    if info_ptr and info_ptr >= 0x20000000:
+        uc.mem_write(info_ptr, flash_info)
+        _emu_log(f"[NVM3_FLASH_INFO] Filled info at 0x{info_ptr:08x}: pageSize=0x{page_size:x}\n")
+
+    # Return ECODE_NVM3_OK (0)
+    uc.reg_write(UC_ARM_REG_R0, 0)

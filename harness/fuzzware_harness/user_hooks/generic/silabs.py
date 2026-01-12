@@ -1,96 +1,59 @@
 """
 Generic Silicon Labs Platform Hooks
 
-Platform-level hooks for Silicon Labs EFR32 devices (reusable across projects).
+Platform-level hooks for Silicon Labs EFR32 devices.
 Provides logging, timers, crypto bypass, and other common platform services.
 
-For device-specific hooks (provisioning, protocols, hardware bypass), see:
-- user_hooks/projects/silabs_brd2601b/ - Matter provisioning hooks
-- user_hooks/projects/silabs_heiman_smoke/ - Heiman device-specific hooks
-- user_hooks/projects/README.md - Guide for creating project-specific hooks
+Log files:
+- /tmp/firmware.log  - Firmware output (println, RTT, UART)
+- /tmp/emulator.log  - Emulator debug info (hooks, traces)
 """
 import sys
 import os
 from unicorn.arm_const import UC_ARM_REG_R0, UC_ARM_REG_R1, UC_ARM_REG_R2, UC_ARM_REG_R3, UC_ARM_REG_SP
 
-# Log levels
-LOG_LEVEL_DEBUG = 0
-LOG_LEVEL_INFO = 1
-LOG_LEVEL_WARN = 2
-LOG_LEVEL_ERROR = 3
+# =============================================================================
+# Simple Two-File Logging
+# =============================================================================
+FIRMWARE_LOG = os.environ.get('FIRMWARE_LOG', '/tmp/firmware.log')
+EMULATOR_LOG = os.environ.get('EMULATOR_LOG', '/tmp/emulator.log')
 
-# Current log level - default to INFO
-_log_level = LOG_LEVEL_INFO
+_firmware_log_file = None
+_emulator_log_file = None
 
-# Parse log level from environment variable
-_env_log_level = os.environ.get('FUZZWARE_LOG_LEVEL', 'INFO').upper()
-if _env_log_level == 'DEBUG':
-    _log_level = LOG_LEVEL_DEBUG
-elif _env_log_level == 'INFO':
-    _log_level = LOG_LEVEL_INFO
-elif _env_log_level == 'WARN':
-    _log_level = LOG_LEVEL_WARN
-elif _env_log_level == 'ERROR':
-    _log_level = LOG_LEVEL_ERROR
-
-# Log file path - can be overridden via environment variable
-LOG_FILE_PATH = os.environ.get('FUZZWARE_LOG_FILE', '/tmp/fuzzware_console.log')
-_log_file = None
-
-# Simulated time tracking for timestamps
-_sim_time_ms = 0
-
-def _get_log_file():
-    """Get or create the log file handle"""
-    global _log_file
-    if _log_file is None:
-        _log_file = open(LOG_FILE_PATH, 'a')
-    return _log_file
-
-def _write_log(msg):
-    """Write message to both stdout and log file"""
-    # Write to stdout
+def _fw_log(msg):
+    """Write to firmware.log (firmware output: println, RTT, UART)"""
+    global _firmware_log_file
+    if _firmware_log_file is None:
+        _firmware_log_file = open(FIRMWARE_LOG, 'a')
+    _firmware_log_file.write(msg)
+    _firmware_log_file.flush()
     sys.stdout.write(msg)
     sys.stdout.flush()
-    # Write to file
-    f = _get_log_file()
-    f.write(msg)
-    f.flush()
 
+def _emu_log(msg):
+    """Write to emulator.log (emulator debug: hooks, NVM3, traces)"""
+    global _emulator_log_file
+    if _emulator_log_file is None:
+        _emulator_log_file = open(EMULATOR_LOG, 'a')
+    _emulator_log_file.write(msg)
+    _emulator_log_file.flush()
 
-def _log_debug(msg):
-    """Write debug message if log level is DEBUG"""
-    if _log_level <= LOG_LEVEL_DEBUG:
-        _write_log(msg)
-
+# Legacy aliases for compatibility
+def _write_log(msg):
+    _fw_log(msg)
 
 def _log_info(msg):
-    """Write info message if log level is INFO or lower"""
-    if _log_level <= LOG_LEVEL_INFO:
-        _write_log(msg)
+    _fw_log(msg)
 
+def _log_debug(msg):
+    _emu_log(msg)
 
 def _log_warn(msg):
-    """Write warning message if log level is WARN or lower"""
-    if _log_level <= LOG_LEVEL_WARN:
-        _write_log(msg)
-
+    _emu_log(f"[WARN] {msg}")
 
 def _log_error(msg):
-    """Write error message if log level is ERROR or lower"""
-    if _log_level <= LOG_LEVEL_ERROR:
-        _write_log(msg)
-
-
-def _get_timestamp():
-    """Get formatted timestamp like [00:00:00.000]"""
-    global _sim_time_ms
-    ms = _sim_time_ms % 1000
-    total_secs = _sim_time_ms // 1000
-    secs = total_secs % 60
-    mins = (total_secs // 60) % 60
-    hours = (total_secs // 3600) % 24
-    return f"[{hours:02d}:{mins:02d}:{secs:02d}.{ms:03d}]"
+    _emu_log(f"[ERROR] {msg}")
 
 
 def _format_va_string(uc, fmt_bytes, va_list_ptr):
