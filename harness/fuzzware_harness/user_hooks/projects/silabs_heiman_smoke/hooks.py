@@ -14,6 +14,10 @@ from ...fuzz import get_fuzz
 # =============================================================================
 # Simple Two-File Logging (same as silabs.py)
 # =============================================================================
+# DEBUG_MODE: Set to True for verbose logging, False for performance
+# When False, all logging is disabled for maximum fuzzing speed
+DEBUG_MODE = os.environ.get('DEBUG_MODE', '0') == '1'
+
 FIRMWARE_LOG = os.environ.get('FIRMWARE_LOG', '/tmp/firmware.log')
 EMULATOR_LOG = os.environ.get('EMULATOR_LOG', '/tmp/emulator.log')
 
@@ -21,7 +25,9 @@ _firmware_log_file = None
 _emulator_log_file = None
 
 def _fw_log(msg):
-    """Write to firmware.log"""
+    """Write to firmware.log (only if DEBUG_MODE)"""
+    if not DEBUG_MODE:
+        return
     global _firmware_log_file
     if _firmware_log_file is None:
         _firmware_log_file = open(FIRMWARE_LOG, 'a')
@@ -29,19 +35,98 @@ def _fw_log(msg):
     _firmware_log_file.flush()
 
 def _emu_log(msg):
-    """Write to emulator.log"""
+    """Write to emulator.log (only if DEBUG_MODE)"""
+    if not DEBUG_MODE:
+        return
     global _emulator_log_file
     if _emulator_log_file is None:
         _emulator_log_file = open(EMULATOR_LOG, 'a')
     _emulator_log_file.write(msg)
     _emulator_log_file.flush()
 
-# Legacy alias
-def _log(msg):
+def _emu_debug_log(msg):
+    """Write debug message to emulator.log (only if DEBUG_MODE). Adds newline if missing."""
+    if not DEBUG_MODE:
+        return
+    if not msg.endswith('\n'):
+        msg = msg + '\n'
     _emu_log(msg)
 
+# =============================================================================
+# Input Logging for Crash Reproduction (Persistent No-Reset Mode)
+# =============================================================================
+
+INPUT_LOG_DIR = os.environ.get('FUZZ_INPUT_LOG_DIR', '/tmp/fuzz_inputs')
+_input_log = []  # List of (iteration, raw_bytes) tuples
+_input_iteration = 0
+
+# TX response counting for verification
+_tx_response_count = 0
+_rx_packet_count = 0
+
+def get_tx_rx_stats():
+    """Return TX/RX statistics for verification"""
+    return _tx_response_count, _rx_packet_count
+
+def reset_tx_rx_stats():
+    """Reset TX/RX counters"""
+    global _tx_response_count, _rx_packet_count
+    _tx_response_count = 0
+    _rx_packet_count = 0
+
+def increment_tx_count():
+    """Increment TX response counter"""
+    global _tx_response_count
+    _tx_response_count += 1
+
+def increment_rx_count():
+    """Increment RX packet counter"""
+    global _rx_packet_count
+    _rx_packet_count += 1
+
+def _log_input(raw_bytes):
+    """Log a fuzz input for later reproduction"""
+    global _input_iteration
+    _input_iteration += 1
+    _input_log.append((_input_iteration, raw_bytes))
+
+    # Keep log bounded to prevent memory exhaustion
+    MAX_LOG_SIZE = 100000
+    if len(_input_log) > MAX_LOG_SIZE:
+        _input_log.pop(0)
+
+def _save_input_log(reason="exit"):
+    """Save input log to file for crash reproduction"""
+    if not _input_log:
+        return
+
+    try:
+        os.makedirs(INPUT_LOG_DIR, exist_ok=True)
+        import time
+        timestamp = int(time.time())
+        filename = os.path.join(INPUT_LOG_DIR, f"inputs_{timestamp}_{reason}.log")
+
+        with open(filename, 'w') as f:
+            f.write(f"# Fuzz input log - {reason}\n")
+            f.write(f"# Total inputs: {len(_input_log)}\n")
+            f.write(f"# Format: iteration_number hex_bytes\n\n")
+            for iteration, raw_bytes in _input_log:
+                f.write(f"{iteration} {raw_bytes.hex()}\n")
+
+        _emu_debug_log(f"[INPUT_LOG] Saved {len(_input_log)} inputs to {filename}")
+    except Exception as e:
+        _emu_debug_log(f"[INPUT_LOG] Failed to save: {e}")
+
+def _clear_input_log():
+    """Clear input log for next fuzzing session"""
+    global _input_log, _input_iteration
+    _input_log = []
+    _input_iteration = 0
+
 def _log_uart_packet(direction, data, notes=""):
-    """Log UART packet to emulator.log"""
+    """Log UART packet to emulator.log (only if DEBUG_MODE)"""
+    if not DEBUG_MODE:
+        return
     if isinstance(data, (bytes, bytearray)):
         hex_data = data.hex()
     else:
@@ -71,6 +156,7 @@ def xQueueGenericSend_intercept(uc):
             if b'\xaa\x55' in data:
                 idx = data.index(b'\xaa\x55')
                 _emu_log(f"[UART_TX] {data[idx:idx+32].hex()}\n")
+                increment_tx_count()  # Count TX response
         except Exception as e:
             pass
 
@@ -103,13 +189,19 @@ def QueuePutWrapper_intercept(uc):
 # ============================================================================
 # UART Protocol Constants
 # Protocol: AA 55 <len> <devtype> <proto> <seq> <dir> <cmd> <payload...> <crc>
+#
+# Direction field (verified from IDA analysis):
+#   0x01 = Sensor → MCU (request TO firmware) - checked at 0x8008072
+#   0x02 = MCU → Sensor (response FROM firmware) - set at 0x800824e
+#
+# For fuzzing, we send packets with direction=0x01 (pretending to be the sensor)
 # ============================================================================
 
 UART_MAGIC = b'\xAA\x55'
 UART_DEV_TYPE = 0x60      # Smoke detector device type
 UART_PROTO_VER = 0x06     # Protocol version (firmware checks for 0x06)
-UART_DIR_TO_SENSOR = 0x01 # Direction: host -> sensor
-UART_DIR_FROM_SENSOR = 0x02
+UART_DIR_SENSOR_TO_MCU = 0x01  # Sensor → MCU (incoming request)
+UART_DIR_MCU_TO_SENSOR = 0x02  # MCU → Sensor (outgoing response)
 
 # UART RX buffer address in RAM (found from firmware analysis)
 UART_RX_BUFFER_ADDR = 0x200187EC
@@ -127,7 +219,7 @@ def _calc_uart_crc(data):
     return crc
 
 
-def _wrap_fuzz_as_uart_packet(fuzz_payload, cmd=0x01, direction=UART_DIR_TO_SENSOR):
+def _wrap_fuzz_as_uart_packet(fuzz_payload, cmd=0x01, direction=UART_DIR_SENSOR_TO_MCU):
     """
     Wrap fuzz payload in UART protocol format.
     Returns complete packet: AA 55 <len> <devtype> <proto> <seq> <dir> <cmd> <payload> <crc>
@@ -180,7 +272,7 @@ def EUSART_Rx(uc):
         return
 
     uc.reg_write(UC_ARM_REG_R0, fuzz_byte[0])
-    _log(f"[EUSART] RX byte: 0x{fuzz_byte[0]:02x}\n")
+    _emu_log(f"[EUSART] RX byte: 0x{fuzz_byte[0]:02x}\n")
 
 
 # ============================================================================
@@ -195,7 +287,7 @@ def txCurrentPacket(uc):
     This function contains a spin-wait loop at 0x080069cc that blocks indefinitely
     waiting for radio TX completion. Skip and return 0 (success).
     """
-    _log("[HEIMAN] Skipping txCurrentPacket (radio TX spin-wait)\n")
+    _emu_log("[HEIMAN] Skipping txCurrentPacket (radio TX spin-wait)\n")
     uc.reg_write(UC_ARM_REG_R0, 0)  # Return success
 
 
@@ -204,7 +296,7 @@ def efr32RadioProcess(uc):
     Skip efr32RadioProcess @ 0x08023108
     Main radio processing function that could block on hardware.
     """
-    _log("[HEIMAN] Skipping efr32RadioProcess\n")
+    _emu_log("[HEIMAN] Skipping efr32RadioProcess\n")
     uc.reg_write(UC_ARM_REG_R0, 0)
 
 
@@ -214,7 +306,7 @@ def otPlatRadioTransmit(uc):
     OpenThread radio transmit - skip hardware interaction.
     Returns OT_ERROR_NONE (0).
     """
-    _log("[HEIMAN] Skipping otPlatRadioTransmit\n")
+    _emu_log("[HEIMAN] Skipping otPlatRadioTransmit\n")
     uc.reg_write(UC_ARM_REG_R0, 0)  # OT_ERROR_NONE
 
 
@@ -224,7 +316,7 @@ def otPlatRadioReceive(uc):
     OpenThread radio receive - skip hardware interaction.
     Returns OT_ERROR_NONE (0).
     """
-    _log("[HEIMAN] Skipping otPlatRadioReceive\n")
+    _emu_log("[HEIMAN] Skipping otPlatRadioReceive\n")
     uc.reg_write(UC_ARM_REG_R0, 0)  # OT_ERROR_NONE
 
 
@@ -257,7 +349,7 @@ def radioSetIdle(uc):
     Skip radioSetIdle @ 0x08022298
     Skip radio idle state setup.
     """
-    _log("[HEIMAN] Skipping radioSetIdle\n")
+    _emu_log("[HEIMAN] Skipping radioSetIdle\n")
     uc.reg_write(UC_ARM_REG_R0, 0)
 
 
@@ -282,7 +374,7 @@ def txFailedCallback(uc):
     Skip txFailedCallback @ 0x0802249c
     TX failure callback - skip to avoid recursion into radio code.
     """
-    _log("[HEIMAN] Skipping txFailedCallback\n")
+    _emu_log("[HEIMAN] Skipping txFailedCallback\n")
 
 
 def RAILCb_Generic(uc):
@@ -290,7 +382,7 @@ def RAILCb_Generic(uc):
     Skip RAILCb_Generic @ 0x080224e0
     Generic RAIL callback - skip hardware interaction.
     """
-    _log("[HEIMAN] Skipping RAILCb_Generic\n")
+    _emu_log("[HEIMAN] Skipping RAILCb_Generic\n")
 
 
 def otPlatRadioGetRssi(uc):
@@ -557,7 +649,7 @@ def GPIO_EVEN_IRQHandler(uc):
     Skip GPIO_EVEN_IRQHandler @ 0x08009914
     Prevents GPIO handlers from consuming fuzz input.
     """
-    _log("[HEIMAN] Skipping GPIO_EVEN_IRQHandler\n")
+    _emu_log("[HEIMAN] Skipping GPIO_EVEN_IRQHandler\n")
 
 
 def GPIO_ODD_IRQHandler(uc):
@@ -565,7 +657,7 @@ def GPIO_ODD_IRQHandler(uc):
     Skip GPIO_ODD_IRQHandler @ 0x08009938
     Prevents GPIO handlers from consuming fuzz input.
     """
-    _log("[HEIMAN] Skipping GPIO_ODD_IRQHandler\n")
+    _emu_log("[HEIMAN] Skipping GPIO_ODD_IRQHandler\n")
 
 
 # ============================================================================
@@ -609,7 +701,7 @@ def uart_fuzz_entry(uc):
 
     # Build packet
     seq = 0
-    direction = 0x01  # To sensor
+    direction = UART_DIR_SENSOR_TO_MCU  # 0x01 = Sensor → MCU
     header = bytes([UART_DEV_TYPE, UART_PROTO_VER, seq, direction, cmd])  # devtype, proto, seq, dir, cmd
     packet_len = len(header) + len(payload)
     packet_body = bytes([packet_len]) + header + payload
@@ -629,7 +721,7 @@ def uart_fuzz_entry(uc):
     uc.reg_write(UC_ARM_REG_R0, FUZZ_BUFFER_ADDR)
     uc.reg_write(UC_ARM_REG_R1, len(uart_packet))
 
-    _log(f"[UART_FUZZ] Injected {len(uart_packet)} bytes: {uart_packet.hex()}\n")
+    _emu_log(f"[UART_FUZZ] Injected {len(uart_packet)} bytes: {uart_packet.hex()}\n")
 
     # Continue execution into UART_ParsePackets
     return False  # Don't skip, let function execute
@@ -652,7 +744,7 @@ def uart_fuzz_harness(uc):
     payload = raw_fuzz[1:] if len(raw_fuzz) > 1 else b''
 
     seq = 0
-    direction = 0x01
+    direction = UART_DIR_SENSOR_TO_MCU  # 0x01 = Sensor → MCU
     header = bytes([UART_DEV_TYPE, UART_PROTO_VER, seq, direction, cmd])
     packet_len = len(header) + len(payload)
     packet_body = bytes([packet_len]) + header + payload
@@ -678,7 +770,7 @@ def uart_fuzz_harness(uc):
     uc.reg_write(UC_ARM_REG_LR, old_pc | 1)  # Return to where we were
     uc.reg_write(UC_ARM_REG_PC, 0x0800803c | 1)  # UART_ParsePackets (thumb)
 
-    _log(f"[UART_HARNESS] Called UART_ParsePackets with {len(uart_packet)} bytes\n")
+    _emu_log(f"[UART_HARNESS] Called UART_ParsePackets with {len(uart_packet)} bytes\n")
 
 
 def uart_interrupt_inject(uc):
@@ -722,7 +814,7 @@ def uart_interrupt_inject(uc):
             payload = payload[:MAX_PAYLOAD]
 
         seq = 0
-        direction = 0x01
+        direction = UART_DIR_SENSOR_TO_MCU  # 0x01 = Sensor → MCU
         header = bytes([UART_DEV_TYPE, UART_PROTO_VER, seq, direction, cmd])
         packet_len = len(header) + len(payload)
         packet_body = bytes([packet_len]) + header + payload
@@ -748,7 +840,7 @@ def uart_interrupt_inject(uc):
         uc.reg_write(UC_ARM_REG_LR, old_pc | 1)  # Return to interrupted code
         uc.reg_write(UC_ARM_REG_PC, 0x0800803c | 1)  # UART_ParsePackets
 
-        _log(f"[UART_IRQ] Injected {len(uart_packet)} bytes, calling UART_ParsePackets\n")
+        _emu_log(f"[UART_IRQ] Injected {len(uart_packet)} bytes, calling UART_ParsePackets\n")
 
     except Exception as e:
         pass  # Silently ignore errors in interrupt context
@@ -764,7 +856,7 @@ def trigger_fuzz_consumption(uc):
     import ctypes
     from fuzzware_harness import native
 
-    print("[FUZZ] trigger_fuzz_consumption CALLED!", file=sys.stderr, flush=True)
+    _emu_debug_log("[FUZZ] trigger_fuzz_consumption CALLED!")
 
     try:
         uc_handle = uc._uch
@@ -778,10 +870,10 @@ def trigger_fuzz_consumption(uc):
             if ptr_addr and ptr_addr != 0:
                 fuzz_data = (ctypes.c_char * bytes_to_get).from_address(ptr_addr).raw
                 _emu_log(f"[FUZZ_CONSUME] mainInit consumed {len(fuzz_data)} bytes: {fuzz_data[:16].hex()}...\n")
-                print(f"[FUZZ] Consumed {len(fuzz_data)} bytes at mainInit", file=sys.stderr, flush=True)
+                _emu_debug_log(f"[FUZZ] Consumed {len(fuzz_data)} bytes at mainInit")
 
     except Exception as e:
-        print(f"[FUZZ] Error: {e}", file=sys.stderr, flush=True)
+        _emu_debug_log(f"[FUZZ] Error: {e}")
 
     # Continue normal execution
 
@@ -827,8 +919,8 @@ def debug_appinit_reached(uc):
     """Debug hook - print and exit when AppInit is reached."""
     pc = uc.reg_read(UC_ARM_REG_PC)
     lr = uc.reg_read(UC_ARM_REG_LR)
-    print(f"[DEBUG] *** AppInit reached! PC=0x{pc:08x} LR=0x{lr:08x} ***", file=sys.stderr, flush=True)
-    print(f"[DEBUG] Boot sequence successful - exiting", file=sys.stderr, flush=True)
+    _emu_debug_log(f"[DEBUG] *** AppInit reached! PC=0x{pc:08x} LR=0x{lr:08x} ***")
+    _emu_debug_log(f"[DEBUG] Boot sequence successful - exiting")
     _emu_log(f"[AppInit] Reached SilabsMatterConfig::AppInit at 0x{pc:08x}\n")
     # Force exit
     import os
@@ -864,15 +956,16 @@ def println_with_uart_redirect(uc):
     except:
         msg = "<error reading string>"
 
-    # Log with timestamp
-    timestamp = time.strftime('%Y-%m-%d, %H:%M:%S', time.localtime())
-    _fw_log(f"[{timestamp}, 0x{pc:08x}] {msg}\n")
+    # Firmware logging disabled for performance - uncomment for debugging:
+    # timestamp = time.strftime('%Y-%m-%d, %H:%M:%S', time.localtime())
+    # _fw_log(f"[{timestamp}, 0x{pc:08x}] {msg}\n")
 
     # Check for applicationUserInit - this is the last safe point before FreeRTOS ASSERT
     if "applicationUserInit" in msg and not _app_user_init_seen:
         _app_user_init_seen = True
-        _emu_log(f"[PRINTLN] Detected applicationUserInit - redirecting to UART fuzzing\n")
-        print(f"[UART_REDIRECT] Detected applicationUserInit - redirecting to UART fuzzing", file=sys.stderr, flush=True)
+        # Logging disabled for performance - uncomment for debugging:
+        # _emu_log(f"[PRINTLN] Detected applicationUserInit - redirecting to UART fuzzing\n")
+        # print(f"[UART_REDIRECT] Detected applicationUserInit - redirecting to UART fuzzing", file=sys.stderr, flush=True)
 
         # Redirect to UART fuzzing - this bypasses FreeRTOS
         start_uart_fuzzing(uc)
@@ -914,7 +1007,7 @@ def println_mainInit_redirect(uc):
     if "mainInit" in msg and not _mainInit_seen:
         _mainInit_seen = True
         _emu_log(f"[PRINTLN] Detected mainInit - redirecting to UART fuzzing\n")
-        print(f"[PRINTLN] Detected mainInit - will redirect to UART fuzzing", file=sys.stderr, flush=True)
+        _emu_debug_log(f"[PRINTLN] Detected mainInit - will redirect to UART fuzzing")
 
         # Redirect to UART fuzzing
         start_uart_fuzzing(uc)
@@ -926,14 +1019,14 @@ def debug_trace(uc):
     _trace_counter += 1
     pc = uc.reg_read(UC_ARM_REG_PC)
     if _trace_counter <= 20:  # Only first 20 calls
-        print(f"[TRACE {_trace_counter}] PC=0x{pc:08x}", file=sys.stderr, flush=True)
+        _emu_debug_log(f"[TRACE {_trace_counter}] PC=0x{pc:08x}")
 
 def debug_kernel_start(uc):
     """Debug hook to trace when kernel start is called."""
     global _boot_count
     _boot_count += 1
     pc = uc.reg_read(UC_ARM_REG_PC)
-    print(f"[DEBUG BOOT {_boot_count}] _start called at PC=0x{pc:08x}", file=sys.stderr, flush=True)
+    _emu_debug_log(f"[DEBUG BOOT {_boot_count}] _start called at PC=0x{pc:08x}")
     # Continue normally (do_return: false in config)
 
 
@@ -941,14 +1034,14 @@ def debug_scheduler_start(uc):
     """Debug hook to trace when vTaskStartScheduler is called."""
     global _boot_count
     pc = uc.reg_read(UC_ARM_REG_PC)
-    print(f"[DEBUG BOOT {_boot_count}] start() called at PC=0x{pc:08x}", file=sys.stderr, flush=True)
+    _emu_debug_log(f"[DEBUG BOOT {_boot_count}] start() called at PC=0x{pc:08x}")
     # Continue normally (do_return: false in config)
 
 
 def debug_idle_hook(uc):
     """Debug hook to trace idle task execution."""
     global _boot_count
-    print(f"[DEBUG BOOT {_boot_count}] sl_platform_init called", file=sys.stderr, flush=True)
+    _emu_debug_log(f"[DEBUG BOOT {_boot_count}] sl_platform_init called")
     # Continue normally (do_return: false in config)
 
 
@@ -956,7 +1049,7 @@ def debug_kernel_real(uc):
     """Debug hook for the real sl_kernel_start."""
     global _boot_count
     pc = uc.reg_read(UC_ARM_REG_PC)
-    print(f"[DEBUG BOOT {_boot_count}] sl_kernel_start (real) at PC=0x{pc:08x}", file=sys.stderr, flush=True)
+    _emu_debug_log(f"[DEBUG BOOT {_boot_count}] sl_kernel_start (real) at PC=0x{pc:08x}")
 
 
 def debug_abort(uc):
@@ -964,7 +1057,7 @@ def debug_abort(uc):
     global _boot_count
     pc = uc.reg_read(UC_ARM_REG_PC)
     lr = uc.reg_read(UC_ARM_REG_LR)
-    print(f"[DEBUG BOOT {_boot_count}] ABORT called! PC=0x{pc:08x} LR=0x{lr:08x}", file=sys.stderr, flush=True)
+    _emu_debug_log(f"[DEBUG BOOT {_boot_count}] ABORT called! PC=0x{pc:08x} LR=0x{lr:08x}")
 
 
 def debug_assert(uc):
@@ -972,7 +1065,7 @@ def debug_assert(uc):
     global _boot_count
     pc = uc.reg_read(UC_ARM_REG_PC)
     lr = uc.reg_read(UC_ARM_REG_LR)
-    print(f"[DEBUG BOOT {_boot_count}] ASSERT failed! PC=0x{pc:08x} LR=0x{lr:08x}", file=sys.stderr, flush=True)
+    _emu_debug_log(f"[DEBUG BOOT {_boot_count}] ASSERT failed! PC=0x{pc:08x} LR=0x{lr:08x}")
 
 
 def start_uart_fuzzing(uc):
@@ -980,15 +1073,15 @@ def start_uart_fuzzing(uc):
     Hook for sl_kernel_start - instead of starting the kernel,
     redirect execution to UART_ParsePackets with fuzz data.
 
-    This bypasses FreeRTOS and goes straight to fuzzing the UART parser.
-
-    IMPORTANT: We MUST always attempt to consume fuzz (even if empty) so that
-    fuzzware's discovery phase can detect the fuzz consumption point and set
-    the fork server location correctly.
+    If input starts with AA 55, treat as raw packet (no wrapping).
+    Otherwise, wrap fuzz bytes in UART protocol.
     """
     import sys
     import ctypes
     global _packet_count
+
+    # Install memory hook to detect OOB reads
+    install_oob_memory_hook(uc)
 
     # Reset counters for this fuzzing session
     _packet_count = 0
@@ -996,8 +1089,12 @@ def start_uart_fuzzing(uc):
     _assert_count = 0
     _blocking_count = 0
 
-    print("[UART_FUZZ] Hook entry", file=sys.stderr, flush=True)
-    _log("[UART_FUZZ] Intercepted sl_kernel_start, redirecting to UART parsing\n")
+    # Disable verbose logging for performance (set DEBUG_UART=1 to enable)
+    DEBUG_UART = False
+
+    if DEBUG_UART:
+        _emu_debug_log("[UART_FUZZ] Hook entry")
+    _emu_log("[UART_FUZZ] Intercepted sl_kernel_start, redirecting to UART parsing\n")
 
     from fuzzware_harness import native
 
@@ -1005,11 +1102,8 @@ def start_uart_fuzzing(uc):
         # Get the raw Unicorn handle
         uc_handle = uc._uch
 
-        print("[UART_FUZZ] Calling get_fuzz_ptr", file=sys.stderr, flush=True)
-
         # First, check if there's any fuzz available
         remaining_before = native.fuzz_remaining()
-        print(f"[UART_FUZZ] Remaining before: {remaining_before}", file=sys.stderr, flush=True)
 
         # Request 1 byte to trigger input loading
         ptr_addr = native.native_lib.get_fuzz_ptr(uc_handle, 1)
@@ -1017,10 +1111,8 @@ def start_uart_fuzzing(uc):
         # Check what's available after loading
         remaining_after = native.fuzz_remaining()
         consumed = native.fuzz_consumed()
-        print(f"[UART_FUZZ] After trigger: remaining={remaining_after}, consumed={consumed}", file=sys.stderr, flush=True)
 
         if ptr_addr is None or ptr_addr == 0:
-            print("[UART_FUZZ] No fuzz available (empty input)", file=sys.stderr, flush=True)
             raw_fuzz = b'\x01'  # Default command byte
         else:
             # Read the first byte
@@ -1040,39 +1132,44 @@ def start_uart_fuzzing(uc):
             else:
                 raw_fuzz = first_byte
 
-            print(f"[UART_FUZZ] Got {len(raw_fuzz)} bytes", file=sys.stderr, flush=True)
-
     except Exception as e:
         import traceback
-        print(f"[UART_FUZZ] Error: {e}\n{traceback.format_exc()}", file=sys.stderr, flush=True)
+        _emu_debug_log(f"[UART_FUZZ] Error: {e}\n{traceback.format_exc()}")
         raw_fuzz = b'\x01'  # Use default on error
 
-    # Build UART packet
-    cmd = raw_fuzz[0] if len(raw_fuzz) > 0 else 0x01
-    payload = raw_fuzz[1:] if len(raw_fuzz) > 1 else b''
+    # Debug: show what fuzz we got
+    _emu_debug_log(f"[FUZZ_DEBUG] Got {len(raw_fuzz)} bytes: {raw_fuzz.hex()}")
 
-    # Limit payload size so packet_len fits in one byte (max 255)
-    # Header is 5 bytes (devtype, proto, seq, dir, cmd), so max payload is 250
-    MAX_PAYLOAD = 250
-    if len(payload) > MAX_PAYLOAD:
-        payload = payload[:MAX_PAYLOAD]
+    # Check if input is already a raw UART packet (starts with AA 55)
+    if len(raw_fuzz) >= 2 and raw_fuzz[0] == 0xAA and raw_fuzz[1] == 0x55:
+        # Raw packet mode - use as-is
+        uart_packet = raw_fuzz
+        _emu_debug_log(f"[RAW_MODE] Using raw packet: {uart_packet.hex()}")
+    else:
+        # Build UART packet from fuzz bytes
+        cmd = raw_fuzz[0] if len(raw_fuzz) > 0 else 0x01
+        payload = raw_fuzz[1:] if len(raw_fuzz) > 1 else b''
 
-    seq = 0
-    direction = 0x01
-    header = bytes([UART_DEV_TYPE, UART_PROTO_VER, seq, direction, cmd])
-    packet_len = len(header) + len(payload)
-    packet_body = bytes([packet_len]) + header + payload
+        MAX_PAYLOAD = 250
+        if len(payload) > MAX_PAYLOAD:
+            payload = payload[:MAX_PAYLOAD]
 
-    crc = 0
-    for b in packet_body:
-        crc ^= b
+        seq = 0
+        direction = UART_DIR_SENSOR_TO_MCU
+        header = bytes([UART_DEV_TYPE, UART_PROTO_VER, seq, direction, cmd])
+        packet_len = len(header) + len(payload)
+        packet_body = bytes([packet_len]) + header + payload
 
-    uart_packet = b'\xAA\x55' + packet_body + bytes([crc])
+        crc = 0
+        for b in packet_body:
+            crc ^= b
+
+        uart_packet = b'\xAA\x55' + packet_body + bytes([crc])
 
     # Write to buffer
     uc.mem_write(FUZZ_BUFFER_ADDR, uart_packet)
 
-    _log(f"[UART_FUZZ] Prepared {len(uart_packet)} byte packet: {uart_packet.hex()}\n")
+    _emu_log(f"[UART_FUZZ] Prepared {len(uart_packet)} byte packet: {uart_packet.hex()}\n")
 
     # Log UART RX packet to file with formatting
     _log_uart_packet("RX", uart_packet, "Fuzz input wrapped with UART protocol")
@@ -1095,8 +1192,8 @@ def start_uart_fuzzing(uc):
     # Set PC to UART_ParsePackets
     uc.reg_write(UC_ARM_REG_PC, 0x0800803c | 1)
 
-    _log(f"[UART_FUZZ] Set up call to UART_ParsePackets({FUZZ_BUFFER_ADDR:#x}, {len(uart_packet)})\n")
-    _log(f"[UART_FUZZ] LR={LOOP_ADDR | 1:#x}, PC=0x0800803d\n")
+    _emu_log(f"[UART_FUZZ] Set up call to UART_ParsePackets({FUZZ_BUFFER_ADDR:#x}, {len(uart_packet)})\n")
+    _emu_log(f"[UART_FUZZ] LR={LOOP_ADDR | 1:#x}, PC=0x0800803d\n")
 
     # Return False to let execution continue at new PC (not the patched bx lr)
     return False
@@ -1107,6 +1204,44 @@ def start_uart_fuzzing(uc):
 # ============================================================================
 
 _packet_count = 0
+
+
+def _trigger_uart_tx(uc, tx_func_addr):
+    """
+    Trigger UART_DoTransmit to send any pending TX response.
+
+    This function saves current state, calls UART_DoTransmit, and restores state.
+    UART_DoTransmit reads response data from globals and sends via UARTDRV_ForceTransmit.
+    """
+    from unicorn.arm_const import UC_ARM_REG_PC, UC_ARM_REG_LR, UC_ARM_REG_SP
+
+    # Save current registers
+    saved_pc = uc.reg_read(UC_ARM_REG_PC)
+    saved_lr = uc.reg_read(UC_ARM_REG_LR)
+
+    # Set up return address to a safe location (we'll catch it)
+    RETURN_ADDR = 0x20018100  # Unused RAM location
+
+    try:
+        # Write return instruction at return address
+        uc.mem_write(RETURN_ADDR, b'\x70\x47')  # BX LR (return)
+
+        # Set up call to UART_DoTransmit
+        uc.reg_write(UC_ARM_REG_LR, RETURN_ADDR | 1)  # Thumb mode
+        uc.reg_write(UC_ARM_REG_PC, tx_func_addr | 1)  # Thumb mode
+
+        # Execute until return
+        try:
+            uc.emu_start(tx_func_addr | 1, RETURN_ADDR, timeout=100000, count=10000)
+        except Exception as e:
+            _emu_log(f"[UART_TX_TRIGGER] Execution ended: {e}\n")
+
+    except Exception as e:
+        _emu_log(f"[UART_TX_TRIGGER] Error: {e}\n")
+
+    # Restore PC (LR doesn't need restoring as we're in the loop handler)
+    uc.reg_write(UC_ARM_REG_PC, saved_pc)
+
 
 def uart_persistent_loop(uc):
     """
@@ -1120,6 +1255,7 @@ def uart_persistent_loop(uc):
     This avoids the snapshot/restore overhead for multi-packet fuzzing.
     """
     import ctypes
+    import sys
     from fuzzware_harness import native
     global _packet_count
 
@@ -1129,11 +1265,23 @@ def uart_persistent_loop(uc):
     remaining = native.fuzz_remaining()
 
     if remaining == 0:
+        # Trigger TX for the last packet before exiting
+        # (nested emu_start causes issues with multi-packet processing,
+        # so only do this on the final packet)
+        UART_DO_TRANSMIT_ADDR = 0x8008294
+        _trigger_uart_tx(uc, UART_DO_TRANSMIT_ADDR)
+        # Print TX/RX stats for verification
+        tx_count, rx_count = get_tx_rx_stats()
+        _emu_debug_log(f"[STATS] RX packets: {_packet_count}, TX responses: {tx_count}")
+
         # No more fuzz - exit cleanly
         _emu_log(f"[UART_LOOP] Processed {_packet_count} packets, fuzz exhausted - exiting\n")
-        # Return to a NOP sled or just let execution stop
-        # Setting PC to 0 will trigger clean exit
-        uc.reg_write(UC_ARM_REG_PC, 0)
+        # Save input log for this session (useful for persistent no-reset mode)
+        _save_input_log("fuzz_exhausted")
+        _clear_input_log()
+        # Use do_exit for clean exit (returns UC_ERR_OK instead of SIGSEGV)
+        # This is important for persistent mode to work correctly with AFL
+        native.do_exit(uc, 0)  # 0 = UC_ERR_OK (clean exit)
         return True
 
     _emu_log(f"[UART_LOOP] Packet {_packet_count} done, {remaining} fuzz bytes remaining - processing next\n")
@@ -1153,6 +1301,9 @@ def uart_persistent_loop(uc):
 
         raw_fuzz = (ctypes.c_char * bytes_to_get).from_address(ptr_addr).raw
 
+        # Log input for crash reproduction (persistent no-reset mode)
+        _log_input(raw_fuzz)
+
         # Build next UART packet
         cmd = raw_fuzz[0] if len(raw_fuzz) > 0 else 0x01
         payload = raw_fuzz[1:] if len(raw_fuzz) > 1 else b''
@@ -1162,7 +1313,7 @@ def uart_persistent_loop(uc):
             payload = payload[:MAX_PAYLOAD]
 
         seq = _packet_count & 0xFF
-        direction = 0x01
+        direction = UART_DIR_SENSOR_TO_MCU  # 0x01 = Sensor → MCU
         header = bytes([UART_DEV_TYPE, UART_PROTO_VER, seq, direction, cmd])
         packet_len = len(header) + len(payload)
         packet_body = bytes([packet_len]) + header + payload
@@ -1202,7 +1353,7 @@ def bypass_stackoverflow_hook(uc):
     """Bypass vApplicationStackOverflowHook - prevent ASSERT message and loop."""
     pc = uc.reg_read(UC_ARM_REG_PC)
     lr = uc.reg_read(UC_ARM_REG_LR)
-    print(f"[STACKOVERFLOW_BYPASS] Hook triggered at PC=0x{pc:08x} LR=0x{lr:08x}", file=sys.stderr, flush=True)
+    _emu_debug_log(f"[STACKOVERFLOW_BYPASS] Hook triggered at PC=0x{pc:08x} LR=0x{lr:08x}")
     _emu_log(f"[STACKOVERFLOW_BYPASS] vApplicationStackOverflowHook bypassed, caller=0x{lr:08x}\n")
     # Return immediately - don't let the function execute
     uc.reg_write(UC_ARM_REG_R0, 0)
@@ -1225,6 +1376,8 @@ def force_return_from_assert_loop(uc):
         pc = uc.reg_read(UC_ARM_REG_PC)
         lr = uc.reg_read(UC_ARM_REG_LR)
         _emu_log(f"[ASSERT] First assert at PC=0x{pc:08x}, LR=0x{lr:08x} - exiting\n")
+        # Save input log on crash for reproduction
+        _save_input_log("assert_crash")
 
     # Exit immediately on any assert - system is broken
     # Use PC=0 to trigger clean exit
@@ -1236,42 +1389,42 @@ def trace_vStartFirstTask(uc):
     """Trace hook for vStartFirstTask - this starts the first FreeRTOS task."""
     pc = uc.reg_read(UC_ARM_REG_PC)
     lr = uc.reg_read(UC_ARM_REG_LR)
-    print(f"[FREERTOS] vStartFirstTask called! PC=0x{pc:08x} LR=0x{lr:08x}", file=sys.stderr, flush=True)
+    _emu_debug_log(f"[FREERTOS] vStartFirstTask called! PC=0x{pc:08x} LR=0x{lr:08x}")
 
 
 def trace_osKernelStart(uc):
     """Trace hook for osKernelStart - CMSIS-RTOS kernel start."""
     pc = uc.reg_read(UC_ARM_REG_PC)
     lr = uc.reg_read(UC_ARM_REG_LR)
-    print(f"[FREERTOS] osKernelStart called! PC=0x{pc:08x} LR=0x{lr:08x}", file=sys.stderr, flush=True)
+    _emu_debug_log(f"[FREERTOS] osKernelStart called! PC=0x{pc:08x} LR=0x{lr:08x}")
 
 
 def trace_vTaskStartScheduler(uc):
     """Trace hook for vTaskStartScheduler - starts FreeRTOS scheduler."""
     pc = uc.reg_read(UC_ARM_REG_PC)
     lr = uc.reg_read(UC_ARM_REG_LR)
-    print(f"[FREERTOS] vTaskStartScheduler called! PC=0x{pc:08x} LR=0x{lr:08x}", file=sys.stderr, flush=True)
+    _emu_debug_log(f"[FREERTOS] vTaskStartScheduler called! PC=0x{pc:08x} LR=0x{lr:08x}")
 
 
 def trace_AppTaskLoop(uc):
     """Trace hook for AppTaskLoop - main application task."""
     pc = uc.reg_read(UC_ARM_REG_PC)
     lr = uc.reg_read(UC_ARM_REG_LR)
-    print(f"[FREERTOS] AppTaskLoop called! PC=0x{pc:08x} LR=0x{lr:08x}", file=sys.stderr, flush=True)
+    _emu_debug_log(f"[FREERTOS] AppTaskLoop called! PC=0x{pc:08x} LR=0x{lr:08x}")
 
 
 def trace_StartJoinHandler(uc):
     """Trace hook for StartJoinHandler - Zigbee join start."""
     pc = uc.reg_read(UC_ARM_REG_PC)
     lr = uc.reg_read(UC_ARM_REG_LR)
-    print(f"[FREERTOS] StartJoinHandler called! PC=0x{pc:08x} LR=0x{lr:08x}", file=sys.stderr, flush=True)
+    _emu_debug_log(f"[FREERTOS] StartJoinHandler called! PC=0x{pc:08x} LR=0x{lr:08x}")
 
 
 def trace_xTaskCreateStatic(uc):
     """Trace hook for xTaskCreateStatic - task creation."""
     pc = uc.reg_read(UC_ARM_REG_PC)
     lr = uc.reg_read(UC_ARM_REG_LR)
-    print(f"[FREERTOS] xTaskCreateStatic called! PC=0x{pc:08x} LR=0x{lr:08x}", file=sys.stderr, flush=True)
+    _emu_debug_log(f"[FREERTOS] xTaskCreateStatic called! PC=0x{pc:08x} LR=0x{lr:08x}")
 
 
 def trace_ram_callback(uc):
@@ -1280,13 +1433,13 @@ def trace_ram_callback(uc):
     lr = uc.reg_read(UC_ARM_REG_LR)
     sp = uc.reg_read(UC_ARM_REG_SP)
     r0 = uc.reg_read(UC_ARM_REG_R0)
-    print(f"[RAM_CALLBACK] Hit 0x20002cb0! PC=0x{pc:08x} LR=0x{lr:08x} SP=0x{sp:08x} R0=0x{r0:08x}", file=sys.stderr, flush=True)
+    _emu_debug_log(f"[RAM_CALLBACK] Hit 0x20002cb0! PC=0x{pc:08x} LR=0x{lr:08x} SP=0x{sp:08x} R0=0x{r0:08x}")
     # Read first few bytes at this address to see what code is there
     try:
         code = uc.mem_read(0x20002cb0, 8)
-        print(f"[RAM_CALLBACK] Code at 0x20002cb0: {code.hex()}", file=sys.stderr, flush=True)
+        _emu_debug_log(f"[RAM_CALLBACK] Code at 0x20002cb0: {code.hex()}")
     except:
-        print(f"[RAM_CALLBACK] Could not read code at 0x20002cb0", file=sys.stderr, flush=True)
+        _emu_debug_log(f"[RAM_CALLBACK] Could not read code at 0x20002cb0")
 
 
 def skip_ram_callback(uc):
@@ -1575,12 +1728,19 @@ def UART_BuildAndSendTx(uc):
     Hook UART_BuildAndSendTx to capture TX packets.
     This is the main function that builds and sends UART responses.
 
-    void UART_BuildAndSendTx(uint8_t cmd, uint8_t *data, uint16_t len)
-    R0 = cmd, R1 = data buffer pointer, R2 = length
+    void UART_BuildAndSendTx(uint8_t cmd, uint8_t seq, uint16_t len, uint8_t *data)
+    R0 = cmd, R1 = seq, R2 = len, R3 = data pointer
     """
+    # Note: Don't count here - count at UARTDRV_ForceTransmit_hook instead
+    # to avoid double counting
+
     cmd = uc.reg_read(UC_ARM_REG_R0)
-    data_ptr = uc.reg_read(UC_ARM_REG_R1)
+    seq = uc.reg_read(UC_ARM_REG_R1)
     length = uc.reg_read(UC_ARM_REG_R2)
+    data_ptr = uc.reg_read(UC_ARM_REG_R3)
+
+    # Debug: only print if DEBUG_MODE
+    _emu_debug_log(f"[UART_TX_HOOK] UART_BuildAndSendTx called: cmd=0x{cmd:02x}, seq=0x{seq:02x}, len={length}")
 
     _emu_log(f"[UART_TX] UART_BuildAndSendTx: cmd=0x{cmd:02x}, data_ptr=0x{data_ptr:08x}, len={length}\n")
 
@@ -1598,13 +1758,13 @@ def UART_BuildAndSendTx(uc):
 def UART_DoTransmit(uc):
     """
     Hook UART_DoTransmit to capture low-level TX.
-    This function handles the actual UART transmission.
-
-    void UART_DoTransmit(uint8_t *buffer, uint16_t len)
-    R0 = buffer pointer, R1 = length
+    This hooks the BL UARTDRV_ForceTransmit at 0x80081f2 where:
+    - R0 = UART handle
+    - R1 = buffer pointer
+    - R2 = length
     """
-    buffer_ptr = uc.reg_read(UC_ARM_REG_R0)
-    length = uc.reg_read(UC_ARM_REG_R1)
+    buffer_ptr = uc.reg_read(UC_ARM_REG_R1)  # R1 = buffer
+    length = uc.reg_read(UC_ARM_REG_R2)      # R2 = length
 
     _emu_log(f"[UART_TX] UART_DoTransmit: buffer=0x{buffer_ptr:08x}, len={length}\n")
 
@@ -1612,6 +1772,8 @@ def UART_DoTransmit(uc):
         try:
             data = uc.mem_read(buffer_ptr, length)
             _emu_log(f"[UART_TX] TX packet: {data.hex()}\n")
+            _log_uart_packet("TX", data, "Response from firmware")
+            increment_tx_count()  # Count actual TX response
         except Exception as e:
             _emu_log(f"[UART_TX] Error reading buffer: {e}\n")
 
@@ -1638,4 +1800,241 @@ def EUSART_Tx(uc):
     byte_val = uc.reg_read(UC_ARM_REG_R1) & 0xFF
     _emu_log(f"[EUSART_TX] 0x{byte_val:02x}\n")
     # Continue - let the real function execute
+    return False
+
+
+def UARTDRV_ForceTransmit_hook(uc):
+    """
+    Hook UARTDRV_ForceTransmit to capture TX data without hardware access.
+
+    Ecode_t UARTDRV_ForceTransmit(UARTDRV_Handle_t handle, uint8_t *data, UARTDRV_Count_t count)
+    R0 = UART handle, R1 = data buffer, R2 = count (length)
+    Returns: ECODE_EMDRV_UARTDRV_OK (0)
+    """
+    handle = uc.reg_read(UC_ARM_REG_R0)
+    buffer_ptr = uc.reg_read(UC_ARM_REG_R1)
+    length = uc.reg_read(UC_ARM_REG_R2)
+
+    _emu_log(f"[UARTDRV_ForceTransmit] handle=0x{handle:08x}, buffer=0x{buffer_ptr:08x}, len={length}\n")
+
+    if buffer_ptr != 0 and length > 0 and length < 512:
+        try:
+            data = uc.mem_read(buffer_ptr, length)
+            _emu_log(f"[UART_TX] {data.hex()}\n")
+            _log_uart_packet("TX", data, "Response from firmware via ForceTransmit")
+            increment_tx_count()
+
+            # Only print to log if DEBUG_MODE for performance
+            _emu_debug_log(f"[UART_TX] {data.hex()}")
+        except Exception as e:
+            _emu_log(f"[UARTDRV_ForceTransmit] Error reading buffer: {e}\n")
+
+    # Return ECODE_EMDRV_UARTDRV_OK (0) - skip hardware access
+    uc.reg_write(UC_ARM_REG_R0, 0)
+
+
+# ============================================================================
+# OOB Read Tracing - Verify V1 vulnerability at runtime
+# ============================================================================
+
+UART_BUFFER_ADDR = 0x200187EC
+UART_BUFFER_SIZE = 128
+
+
+def trace_handler_muting(uc):
+    """Hook HandleCmd_Muting at 0x8007CD8 - see what payload it receives
+
+    When DEBUG_MODE is set and shell is enabled, drops to ipdb for interactive debugging.
+    """
+    r0 = uc.reg_read(UC_ARM_REG_R0)  # a1 = payload byte
+    _emu_debug_log(f"[HANDLER] HandleCmd_Muting called with payload byte: 0x{r0:02x} ({r0})")
+
+    # Drop to ipdb shell if shell mode is enabled
+    # NOTE: These prints must go to stderr for interactive ipdb session
+    if getattr(uc, 'shell', False):
+        import sys as _sys
+        _sys.stderr.write("\n[DEBUG] Dropping to ipdb shell at HandleCmd_Muting\n")
+        _sys.stderr.write("Useful commands:\n")
+        _sys.stderr.write("  uc.regs        - Show registers\n")
+        _sys.stderr.write("  uc.regs.r0     - R0 = payload byte\n")
+        _sys.stderr.write("  uc.mem[addr]   - Read memory\n")
+        _sys.stderr.write("  c              - Continue execution\n")
+        _sys.stderr.write("  q              - Quit\n\n")
+        _sys.stderr.flush()
+        import ipdb
+        ipdb.set_trace()
+
+    return False
+
+
+# Memory hook to detect OOB reads past the UART buffer
+_oob_hook_installed = False
+
+def install_oob_memory_hook(uc):
+    """Install a memory read hook to detect OOB reads past UART buffer"""
+    global _oob_hook_installed
+    if _oob_hook_installed:
+        return
+
+    from unicorn import UC_HOOK_MEM_READ
+
+    # Hook memory reads in the range just after the buffer
+    oob_start = UART_BUFFER_ADDR + UART_BUFFER_SIZE
+    oob_end = oob_start + 256  # Watch 256 bytes past buffer
+
+    def on_mem_read(uc, access, address, size, value, user_data):
+        _emu_debug_log(f"[OOB_READ] *** Memory read at 0x{address:08x} ({size} bytes) - {address - UART_BUFFER_ADDR} bytes from buffer start ***")
+        return True  # Allow the read
+
+    uc.hook_add(UC_HOOK_MEM_READ, on_mem_read, begin=oob_start, end=oob_end)
+    _oob_hook_installed = True
+    _emu_debug_log(f"[OOB_HOOK] Watching for reads in 0x{oob_start:08x}-0x{oob_end:08x}")
+
+def trace_uart_parse_entry(uc):
+    """Hook at entry of UART_ParsePackets (0x800803C) to verify it's called"""
+    r0 = uc.reg_read(UC_ARM_REG_R0)  # buffer pointer
+    r1 = uc.reg_read(UC_ARM_REG_R1)  # length
+
+    _emu_debug_log(f"[PARSE_TRACE] UART_ParsePackets called: buffer=0x{r0:08x}, length={r1}")
+
+    # Read first 20 bytes of buffer
+    try:
+        data = uc.mem_read(r0, min(r1, 20))
+        _emu_debug_log(f"[PARSE_TRACE] Buffer contents: {data.hex()}")
+    except:
+        _emu_debug_log(f"[PARSE_TRACE] Could not read buffer")
+
+    return False  # Continue execution
+
+
+def trace_after_log(uc):
+    """Hook at 0x80080A8 - after BL UART_LogPrintf, before CMP cmd==5"""
+    from unicorn.arm_const import UC_ARM_REG_R6
+    r6 = uc.reg_read(UC_ARM_REG_R6)  # cmd
+    _emu_debug_log(f"[FLOW_TRACE] Reached 0x80080A8 (after log), cmd=0x{r6:02x}")
+    return False
+
+
+def trace_beq_cmd5(uc):
+    """Hook at 0x80080AA - BEQ loc_800812C (branch if cmd==5)"""
+    from unicorn.arm_const import UC_ARM_REG_R6, UC_ARM_REG_PC
+    r6 = uc.reg_read(UC_ARM_REG_R6)
+    pc = uc.reg_read(UC_ARM_REG_PC)
+    _emu_debug_log(f"[FLOW_TRACE] At 0x80080AA (BEQ cmd==5), R6=0x{r6:02x}, PC=0x{pc:08x}")
+    # Check condition: if R6 == 5, branch will be taken
+    if r6 == 5:
+        _emu_debug_log(f"[FLOW_TRACE] >>> BRANCH WILL BE TAKEN (cmd==5)! <<<")
+    else:
+        _emu_debug_log(f"[FLOW_TRACE] >>> BRANCH NOT TAKEN, continuing to 0x80080AC <<<")
+    return False
+
+
+def trace_after_magic_check(uc):
+    """Hook at 0x8008054 - after entering loop, checking first byte"""
+    from unicorn.arm_const import UC_ARM_REG_R4, UC_ARM_REG_R5
+    r4 = uc.reg_read(UC_ARM_REG_R4)
+    r5 = uc.reg_read(UC_ARM_REG_R5)
+    _emu_debug_log(f"[FLOW_TRACE] At 0x8008054 (loop start), i={r4}, buffer=0x{r5:08x}")
+    return False
+
+
+def trace_after_validation(uc):
+    """Hook at 0x8008074 - after all header validations pass"""
+    from unicorn.arm_const import UC_ARM_REG_R4, UC_ARM_REG_R5
+    r4 = uc.reg_read(UC_ARM_REG_R4)
+    _emu_debug_log(f"[FLOW_TRACE] At 0x8008074 (validations PASSED!), i={r4}")
+    return False
+
+
+def trace_ldrb_length(uc):
+    """Hook at 0x8008078 - LDRB.W R8, [R5,R11] (read length field)"""
+    from unicorn.arm_const import UC_ARM_REG_R4, UC_ARM_REG_R5, UC_ARM_REG_R11
+    r4 = uc.reg_read(UC_ARM_REG_R4)
+    r5 = uc.reg_read(UC_ARM_REG_R5)
+    r11 = uc.reg_read(UC_ARM_REG_R11)
+    _emu_debug_log(f"[FLOW_TRACE] At 0x8008078, i={r4}, R5=0x{r5:08x}, R11={r11}")
+    # Read the length byte
+    try:
+        length = uc.mem_read(r5 + r11, 1)[0]
+        _emu_debug_log(f"[FLOW_TRACE]   Length field: {length} (0x{length:02x})")
+    except:
+        _emu_debug_log(f"[FLOW_TRACE]   Could not read length")
+    return False
+
+
+def trace_before_crc_calc(uc):
+    """Hook at 0x8008086 - BL calculate_crc"""
+    from unicorn.arm_const import UC_ARM_REG_R0, UC_ARM_REG_R1
+    r0 = uc.reg_read(UC_ARM_REG_R0)
+    r1 = uc.reg_read(UC_ARM_REG_R1)
+    _emu_debug_log(f"[FLOW_TRACE] At 0x8008086 (calling calculate_crc), buffer=0x{r0:08x}, size={r1}")
+    return False
+
+
+def trace_validation_failed(uc):
+    """Hook at 0x80080C2 - validation failed path"""
+    from unicorn.arm_const import UC_ARM_REG_R4
+    r4 = uc.reg_read(UC_ARM_REG_R4)
+    _emu_debug_log(f"[FLOW_TRACE] At 0x80080C2 (validation FAILED), i={r4}")
+    return False
+
+
+def trace_crc_check(uc):
+    """Hook at 0x80080AC - ADD R9, R5 (setup for CRC read)"""
+    _emu_debug_log(f"[FLOW_TRACE] Reached 0x80080AC (CRC setup)")
+    return False
+
+
+def trace_after_crc_read(uc):
+    """Hook at 0x80080B2 - CMP R2, R7 (after CRC read)"""
+    from unicorn.arm_const import UC_ARM_REG_R2, UC_ARM_REG_R7
+    r2 = uc.reg_read(UC_ARM_REG_R2)  # CRC byte read
+    r7 = uc.reg_read(UC_ARM_REG_R7)  # calculated CRC
+    _emu_debug_log(f"[FLOW_TRACE] Reached 0x80080B2, CRC read=0x{r2:02x}, calculated=0x{r7:02x}")
+    return False
+
+
+def trace_crc_read_oob(uc):
+    """
+    Hook at 0x80080AE - just BEFORE the CRC byte read instruction.
+
+    At this point in UART_ParsePackets:
+      R4 = loop index i
+      R5 = buffer base (0x200187EC)
+      R8 = length field value from packet
+      R9 = i + 7 (added at 0x800808a)
+
+    The next instruction (LDRB.W R2, [R9,R8]) reads CRC at buffer[i+7+length]
+    """
+    # Log to verify hook is called
+    _emu_debug_log("[OOB_TRACE] >>> Hook triggered at 0x80080AE <<<")
+
+    from unicorn.arm_const import UC_ARM_REG_R4, UC_ARM_REG_R5, UC_ARM_REG_R8, UC_ARM_REG_R9
+
+    r4 = uc.reg_read(UC_ARM_REG_R4)   # i (loop index)
+    r5 = uc.reg_read(UC_ARM_REG_R5)   # buffer base
+    r8 = uc.reg_read(UC_ARM_REG_R8)   # length from packet
+    r9 = uc.reg_read(UC_ARM_REG_R9)   # i + 7
+
+    # CRC will be read from: R5 + R9 + R8 = buffer + (i+7) + length
+    crc_offset = (r9 - r5) + r8  # offset from buffer start
+    crc_addr = r5 + crc_offset
+
+    is_oob = crc_offset >= UART_BUFFER_SIZE
+
+    # Log trace (only if DEBUG_MODE)
+    _emu_debug_log(f"[OOB_TRACE] CRC read: i={r4}, length={r8}, offset={crc_offset}, addr=0x{crc_addr:08x}")
+
+    if is_oob:
+        oob_bytes = crc_offset - UART_BUFFER_SIZE
+        _emu_debug_log(f"[OOB_TRACE] *** OUT-OF-BOUNDS READ: {oob_bytes} bytes past buffer! ***")
+
+        # Try to read what's at the OOB address
+        try:
+            oob_value = uc.mem_read(crc_addr, 1)[0]
+            _emu_debug_log(f"[OOB_TRACE] Value at OOB address 0x{crc_addr:08x}: 0x{oob_value:02x}")
+        except Exception as e:
+            _emu_debug_log(f"[OOB_TRACE] Failed to read OOB address: {e}")
+
+    # Continue execution (don't skip the instruction)
     return False

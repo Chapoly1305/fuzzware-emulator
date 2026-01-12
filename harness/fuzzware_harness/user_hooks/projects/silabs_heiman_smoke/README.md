@@ -191,7 +191,6 @@ Key addresses referenced by hooks:
 
 See `/workspaces/fuzzware/examples/siliconlabs/heiman-smoke-detector/` for complete working examples:
 - `config.yml` - Full initialization fuzzing
-- `config_uart_direct.yml` - Direct UART fuzzing (faster)
 
 ## Known Issues
 

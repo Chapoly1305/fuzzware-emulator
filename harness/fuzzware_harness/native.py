@@ -97,6 +97,10 @@ def fuzz_consumed():
 def fuzz_remaining():
     return native_lib.fuzz_remaining()
 
+def set_persistent_no_reset(enabled):
+    """Enable persistent no-reset mode (stateful fuzzing without snapshot restore)"""
+    native_lib.set_persistent_no_reset(1 if enabled else 0)
+
 def get_latest_mmio_fuzz_access_size():
     return native_lib.get_latest_mmio_fuzz_access_size()
 
@@ -454,6 +458,10 @@ def init(uc, mmio_regions, exit_at_bbls, exit_at_hit_num, do_print_exit_info, fu
     # Starting emulation
     # uc_err emulate(uc_engine *uc, char *input_path, char *prefix_input_path);
     _setup_prototype(native_lib, "emulate", ctypes.c_int, uc_engine, ctypes.c_char_p, ctypes.c_char_p)
+
+    # Persistent no-reset mode
+    # void set_persistent_no_reset(uint32_t enabled);
+    _setup_prototype(native_lib, "set_persistent_no_reset", None, ctypes.c_uint32)
 
     mmio_region_starts, mmio_region_ends = zip(*mmio_regions)
     mmio_region_starts_arr = (ctypes.c_int64 * len(mmio_region_starts))(*mmio_region_starts)

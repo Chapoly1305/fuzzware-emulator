@@ -344,6 +344,9 @@ def populate_parser(parser):
     parser.add_argument('--exit-at', dest='exit_at_bbl', default=globs.EXIT_AT_NONE, type=sym_or_addr, help="Exit at the given basic block address.")
     parser.add_argument('--exit-at-hit-num', dest='exit_at_hit_num', type=int, default=1, help="Number of hits of basic block at which to exit. Defaults to 1 (exit on first hit).")
 
+    # Persistent fuzzing mode
+    parser.add_argument('--persistent-no-reset', dest='persistent_no_reset', default=False, action='store_true', help="Enable persistent fuzzing without state reset. Uses AFL++ SHM input with spin-wait. State accumulates between inputs for stateful fuzzing.")
+
     # Trace file generation
     parser.add_argument('--mmio-trace-out', dest='mmio_trace_file', default=None)
     parser.add_argument('--ram-trace-out', dest='ram_trace_file', default=None)
@@ -390,6 +393,11 @@ def main():
     # Collect garbage once in order to avoid doing so while fuzzing
     gc.collect()
     # gc.set_threshold(0, 0, 0)
+
+    # Enable persistent no-reset mode if requested
+    if args.persistent_no_reset:
+        logger.info("Enabling persistent no-reset mode (stateful fuzzing)")
+        native.set_persistent_no_reset(True)
 
     # We do everything in native code from here to avoid any python overhead after configuration is done
     native.emulate(uc, args.input_file, args.prefix_input_path)

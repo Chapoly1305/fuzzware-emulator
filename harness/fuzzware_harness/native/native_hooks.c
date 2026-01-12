@@ -88,6 +88,7 @@ uint32_t ignored_address_pcs[MAX_IGNORED_ADDRESSES];
 uint32_t exit_at_hit_limit = 1;
 
 uint32_t do_fuzz = 0;
+uint32_t persistent_no_reset = 0;
 
 uint64_t instr_limit = 0;
 
@@ -1028,6 +1029,117 @@ static void restore_snapshot(uc_engine *uc) {
     custom_exit_reason = UC_ERR_OK;
 }
 
+void set_persistent_no_reset(uint32_t enabled) {
+    persistent_no_reset = enabled;
+}
+
+// Persistent no-reset mode: spin-wait on SHM input, no state restore
+// This address should match LOOP_ADDR in hooks.py
+#define PERSISTENT_LOOP_ADDR 0x20018000
+
+static void run_persistent_no_reset_loop(uc_engine *uc) {
+    pid_t child_pid = getpid();
+    int sig;
+    uint32_t iteration = 0;
+    uint64_t total_fuzz_consumed = 0;
+    uint64_t total_fuzz_provided = 0;
+    int tmp;
+
+    printf("[PERSISTENT NO-RESET] Starting persistent loop (no state reset)\n");
+    printf("[PERSISTENT NO-RESET] Mode: %s\n", input_mode_SHM ? "SHM" : "FILE");
+    printf("[PERSISTENT NO-RESET] Loop address: 0x%x\n", PERSISTENT_LOOP_ADDR);
+    fflush(stdout);
+
+    for (;;) {
+        ++iteration;
+
+        // Wait for AFL's signal via forkserver protocol (both SHM and file mode)
+        if (read(FORKSRV_FD, &tmp, 4) != 4) {
+            if (iteration == 1) {
+                puts("[PERSISTENT NO-RESET] No forkserver - running single input");
+                // Single run mode - load input file now
+                if (input_path && load_fuzz(input_path) != 0) {
+                    puts("[PERSISTENT NO-RESET] Failed to load input file");
+                    break;
+                }
+            } else {
+                puts("[PERSISTENT NO-RESET] Forkserver closed. Exiting.");
+                break;
+            }
+        } else {
+            // AFL signaled - reload/read input
+            if (input_mode_SHM) {
+                // SHM mode: input already in shared memory, just update pointers
+                fuzz_size = (*(uint32_t *)fuzz) + sizeof(uint32_t);
+                fuzz_cursor = sizeof(uint32_t);
+            } else {
+                // File mode: reload input file
+                if (load_fuzz(input_path) != 0) {
+                    puts("[PERSISTENT NO-RESET] Failed to reload input");
+                    break;
+                }
+            }
+        }
+
+        // Report child PID to AFL
+        if (write(FORKSRV_FD + 1, &child_pid, 4) != 4) {
+            // Not running under AFL - continue anyway for single input
+        }
+
+        // Setup fuzz pointers for this input
+        // (SHM mode: already set above, File mode: set by load_fuzz)
+        if (input_mode_SHM) {
+            total_fuzz_provided += fuzz_size - sizeof(uint32_t);
+        } else {
+            total_fuzz_provided += fuzz_size;
+        }
+        long fuzz_start_cursor = fuzz_cursor;
+
+        // Reset per-iteration state (but NOT emulator state)
+        input_already_given = 0;
+        duplicate_exit = false;
+        custom_exit_reason = UC_ERR_OK;
+
+        // Reset coverage for this iteration (AFL needs fresh coverage)
+        uc_fuzzer_reset_cov(uc, 0);
+
+        // ALWAYS set PC to loop address at start of each iteration
+        // This ensures the persistent loop hook is triggered
+        uint32_t loop_pc = PERSISTENT_LOOP_ADDR | 1;
+        uc_reg_write(uc, UC_ARM_REG_PC, &loop_pc);
+
+        // Run emulation until exit/crash/timeout
+        sig = run_single(uc);
+
+        // Track how much fuzz was actually consumed
+        long consumed_this_iter = fuzz_cursor - fuzz_start_cursor;
+        if (consumed_this_iter > 0) {
+            total_fuzz_consumed += consumed_this_iter;
+        }
+
+        // Report status to AFL via forkserver protocol (PID already written above)
+        if (write(FORKSRV_FD + 1, &sig, 4) != 4) {
+            // Not under AFL or pipe closed
+            if (iteration == 1) {
+                // Single run - exit after first input
+                puts("[PERSISTENT NO-RESET] Single run complete");
+            }
+            break;
+        }
+
+        // NO restore_snapshot(uc) - state persists between inputs!
+
+        // Periodic status with consumption stats
+        if (iteration % 100 == 0) {
+            double consume_rate = total_fuzz_provided > 0 ?
+                (100.0 * total_fuzz_consumed / total_fuzz_provided) : 0;
+            printf("[PERSISTENT NO-RESET] iter=%u, consumed=%lu/%lu bytes (%.1f%%)\n",
+                   iteration, total_fuzz_consumed, total_fuzz_provided, consume_rate);
+            fflush(stdout);
+        }
+    }
+}
+
 uc_err emulate(uc_engine *uc, char *p_input_path, char *prefix_input_path) {
     uint64_t pc = 0;
     fflush(stdout);
@@ -1124,45 +1236,59 @@ uc_err emulate(uc_engine *uc, char *p_input_path, char *prefix_input_path) {
     if(do_fuzz) {
         uc_fuzzer_reset_cov(uc, 1);
         uc_reg_read(uc, UC_ARM_REG_PC, &pc);
-        trigger_snapshotting(uc);
 
-        // AFL-compatible Forkserver loop
-        child_pid = getpid();
-        int count = 0;
-        int tmp = 0;
-        int sig;
-        input_already_given = 0;
-        duplicate_exit = false;
-        for(;;) {
-            ++count;
+        if(persistent_no_reset) {
+            // Persistent no-reset mode: use AFL++ SHM input with spin-wait, no state restore
+            printf("[PERSISTENT NO-RESET] Mode enabled, using SHM input\n");
+            fflush(stdout);
 
-            /* Wait until we are allowed to run  */
-            if(read(FORKSRV_FD, &tmp, 4) != 4) {
-                if(count == 1) {
-                    puts("[FORKSERVER MAIN LOOP] ERROR: Read from FORKSRV_FD to start new execution failed. Exiting");
-                    exit(-1);
-                } else {
-                    puts("[FORKSERVER MAIN LOOP] Forkserver pipe now closed. Exiting");
-                    exit(0);
+            // Still need snapshotting infrastructure for coverage, but won't restore state
+            trigger_snapshotting(uc);
+
+            // Use the persistent no-reset loop
+            run_persistent_no_reset_loop(uc);
+        } else {
+            // Standard AFL forkserver mode with snapshot restore
+            trigger_snapshotting(uc);
+
+            // AFL-compatible Forkserver loop
+            child_pid = getpid();
+            int count = 0;
+            int tmp = 0;
+            int sig;
+            input_already_given = 0;
+            duplicate_exit = false;
+            for(;;) {
+                ++count;
+
+                /* Wait until we are allowed to run  */
+                if(read(FORKSRV_FD, &tmp, 4) != 4) {
+                    if(count == 1) {
+                        puts("[FORKSERVER MAIN LOOP] ERROR: Read from FORKSRV_FD to start new execution failed. Exiting");
+                        exit(-1);
+                    } else {
+                        puts("[FORKSERVER MAIN LOOP] Forkserver pipe now closed. Exiting");
+                        exit(0);
+                    }
                 }
+
+                uc_fuzzer_reset_cov(uc, 0);
+
+                /* Send AFL the child pid thus it can kill it on timeout   */
+                if(write(FORKSRV_FD + 1, &child_pid, 4) != 4) {
+                    printf("[FORKSERVER MAIN LOOP] ERROR: Write to FORKSRV_FD+1 to send fake child PID failed. errno: %d. Description: '%s'. Count: %d\n", errno, strerror(errno), count); fflush(stdout);
+                    exit(-1);
+                }
+
+                sig = run_single(uc);
+
+                if(write(FORKSRV_FD + 1, &sig, 4) != 4) {
+                    puts("[MAIN LOOP] Write to FORKSRV_FD+1 to send status failed");
+                    _exit(-1);
+                }
+
+                restore_snapshot(uc);
             }
-
-            uc_fuzzer_reset_cov(uc, 0);
-
-            /* Send AFL the child pid thus it can kill it on timeout   */
-            if(write(FORKSRV_FD + 1, &child_pid, 4) != 4) {
-                printf("[FORKSERVER MAIN LOOP] ERROR: Write to FORKSRV_FD+1 to send fake child PID failed. errno: %d. Description: '%s'. Count: %d\n", errno, strerror(errno), count); fflush(stdout);
-                exit(-1);
-            }
-
-            sig = run_single(uc);
-
-            if(write(FORKSRV_FD + 1, &sig, 4) != 4) {
-                puts("[MAIN LOOP] Write to FORKSRV_FD+1 to send status failed");
-                _exit(-1);
-            }
-
-            restore_snapshot(uc);
         }
     } else {
         puts("Running without a fork server");
