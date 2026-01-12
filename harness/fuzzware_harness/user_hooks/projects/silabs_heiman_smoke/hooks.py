@@ -880,6 +880,30 @@ _trace_counter = 0
 _mainInit_seen = False
 
 
+_blocking_count = 0
+
+def trace_blocking_call(uc):
+    """Trace blocking FreeRTOS calls and return success to allow progress."""
+    global _blocking_count
+    _blocking_count += 1
+    pc = uc.reg_read(UC_ARM_REG_PC)
+    lr = uc.reg_read(UC_ARM_REG_LR)
+
+    # For NVM3 caller (0x08098031), skip the whole NVM3 operation
+    # by returning to a higher-level caller
+    if (lr & 0xFFFFFFFE) == 0x08098030:
+        print(f"[BLOCKING #{_blocking_count}] NVM3 queue call - returning to higher caller", file=sys.stderr, flush=True)
+        _emu_log(f"[BLOCKING #{_blocking_count}] NVM3 queue at LR=0x{lr:08x} - skipping\n")
+        # Need to figure out where to return to - for now just return success
+        uc.reg_write(UC_ARM_REG_R0, 1)
+        return
+
+    if _blocking_count <= 10:  # Only print first 10
+        print(f"[BLOCKING #{_blocking_count}] PC=0x{pc:08x} LR=0x{lr:08x}", file=sys.stderr, flush=True)
+    _emu_log(f"[BLOCKING #{_blocking_count}] PC=0x{pc:08x} LR=0x{lr:08x}\n")
+    uc.reg_write(UC_ARM_REG_R0, 1)  # Return pdTRUE/success
+
+
 def debug_appinit_reached(uc):
     """Debug hook - print and exit when AppInit is reached."""
     pc = uc.reg_read(UC_ARM_REG_PC)
