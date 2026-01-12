@@ -638,12 +638,10 @@ def appError(uc):
     void appError(chip::ChipError err)
     R0 = ChipError value (32-bit error code)
 
-    This handler logs the error but allows execution to continue
-    instead of aborting.
+    This handler does nothing - use with do_return: false to let
+    the firmware's own error logging run, but skip the abort at the end.
     """
-    err_code = uc.reg_read(UC_ARM_REG_R0)
-    _log_error(f"[APP] appError called with error code {err_code} (0x{err_code:08x})\n")
-    # Don't abort - let the app continue
+    pass  # Let firmware handle logging, we just prevent abort
 
 
 def UARTDRV_Transmit(uc):
@@ -667,6 +665,43 @@ def UARTDRV_Transmit(uc):
         _log_info(f"[UART] (error: {e})\n")
 
     uc.reg_write(UC_ARM_REG_R0, 0)  # Return ECODE_EMDRV_UARTDRV_OK
+
+
+def firmware_printf(uc):
+    """
+    Generic firmware printf handler.
+    printf(const char* fmt, ...)
+    R0 = format string, R1, R2, R3 = variadic args, rest on stack
+
+    Outputs raw firmware log messages to stdout and /tmp/fuzzware_console.log.
+    """
+    from unicorn.arm_const import UC_ARM_REG_LR
+    fmt_ptr = uc.reg_read(UC_ARM_REG_R0)
+    if fmt_ptr == 0:
+        return
+
+    try:
+        # Read format string
+        fmt = uc.mem_read(fmt_ptr, 256)
+        if b'\0' in fmt:
+            fmt = fmt[:fmt.find(b'\0')]
+
+        # Get variadic args from R1, R2, R3 and stack
+        arg_regs = [uc.reg_read(UC_ARM_REG_R1), uc.reg_read(UC_ARM_REG_R2), uc.reg_read(UC_ARM_REG_R3)]
+        stack_ptr = uc.reg_read(UC_ARM_REG_SP)
+
+        # Format and output raw message with date, time, and caller address
+        from datetime import datetime
+        import pytz
+        ny_tz = pytz.timezone('America/New_York')
+        now = datetime.now(ny_tz)
+        date_str = now.strftime('%Y-%m-%d')
+        time_str = now.strftime('%H:%M:%S.%f')[:-3]
+        formatted_msg = _format_variadic_string(uc, fmt, arg_regs, stack_ptr)
+        lr = uc.reg_read(UC_ARM_REG_LR)
+        _write_log(f"[{date_str}, {time_str}, 0x{lr:08x}] {formatted_msg}\n")
+    except Exception:
+        pass  # Silently ignore errors
 
 
 # ============================================================================
