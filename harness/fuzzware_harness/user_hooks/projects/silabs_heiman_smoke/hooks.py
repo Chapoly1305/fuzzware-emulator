@@ -798,12 +798,12 @@ def trace_blocking_call(uc):
     """Trace blocking FreeRTOS calls and return timeout to allow progress."""
     global _blocking_count
     _blocking_count += 1
-    pc = uc.reg_read(UC_ARM_REG_PC)
-    lr = uc.reg_read(UC_ARM_REG_LR)
 
-    if _blocking_count <= 10:
-        print(f"[BLOCKING #{_blocking_count}] PC=0x{pc:08x} LR=0x{lr:08x}", file=sys.stderr, flush=True)
-    _emu_log(f"[BLOCKING #{_blocking_count}] PC=0x{pc:08x} LR=0x{lr:08x}\n")
+    # Only log first 3 blocking calls to reduce overhead
+    if _blocking_count <= 3:
+        pc = uc.reg_read(UC_ARM_REG_PC)
+        lr = uc.reg_read(UC_ARM_REG_LR)
+        _emu_log(f"[BLOCKING #{_blocking_count}] PC=0x{pc:08x} LR=0x{lr:08x}\n")
 
     # Return pdFALSE (0) = timeout/no message, to avoid processing garbage
     uc.reg_write(UC_ARM_REG_R0, 0)
@@ -990,8 +990,11 @@ def start_uart_fuzzing(uc):
     import ctypes
     global _packet_count
 
-    # Reset packet counter for this fuzzing session
+    # Reset counters for this fuzzing session
     _packet_count = 0
+    global _assert_count, _blocking_count
+    _assert_count = 0
+    _blocking_count = 0
 
     print("[UART_FUZZ] Hook entry", file=sys.stderr, flush=True)
     _log("[UART_FUZZ] Intercepted sl_kernel_start, redirecting to UART parsing\n")
@@ -1212,61 +1215,21 @@ def force_return_from_assert_loop(uc):
     Force return from ASSERT infinite loop by setting PC to LR.
     This breaks out of the while(1){} loop after ASSERT message.
 
-    After a few assertions, exit cleanly since the system is broken.
+    After first assertion, exit cleanly since the system is broken.
     """
     global _assert_count
     _assert_count += 1
 
-    pc = uc.reg_read(UC_ARM_REG_PC)
-    lr = uc.reg_read(UC_ARM_REG_LR)
-    sp = uc.reg_read(UC_ARM_REG_SP)
+    # Log only the first assert (reduce logging overhead)
+    if _assert_count == 1:
+        pc = uc.reg_read(UC_ARM_REG_PC)
+        lr = uc.reg_read(UC_ARM_REG_LR)
+        _emu_log(f"[ASSERT] First assert at PC=0x{pc:08x}, LR=0x{lr:08x} - exiting\n")
 
-    # Log only first few
-    if _assert_count <= 3:
-        _emu_log(f"[ASSERT_LOOP_BREAK #{_assert_count}] Breaking infinite loop at PC=0x{pc:08x}, LR=0x{lr:08x}\n")
-        print(f"[ASSERT_LOOP_BREAK] Breaking out of ASSERT infinite loop at 0x{pc:08x}", file=sys.stderr, flush=True)
-
-    # After too many assertions, system is broken - jump to clean exit
-    if _assert_count > 2:
-        # Redirect to an infinite loop that will hit the instruction limit cleanly
-        # Write a clean exit loop to RAM
-        EXIT_LOOP_ADDR = 0x20018100
-        try:
-            # Write "b ." (infinite loop) in Thumb
-            uc.mem_write(EXIT_LOOP_ADDR, b'\xfe\xe7')
-            uc.reg_write(UC_ARM_REG_PC, EXIT_LOOP_ADDR | 1)
-            _emu_log(f"[ASSERT_LOOP_BREAK] Too many asserts ({_assert_count}), exiting via loop\n")
-        except:
-            pass
-        return False
-
-    # For first assertion, try to find a valid return address further up the stack
-    # Skip addresses in the 0x08010xxx range (FreeRTOS error handlers)
-    try:
-        for offset in range(0, 128, 4):
-            ret_addr = int.from_bytes(uc.mem_read(sp + offset, 4), 'little')
-            # Find ROM address that's NOT in FreeRTOS error handler range
-            if 0x08000000 <= ret_addr <= 0x080FFFFF:
-                # Skip if in FreeRTOS error handler range (0x08010000-0x08011000) or ASSERT range
-                if 0x08010000 <= ret_addr <= 0x08011000:
-                    continue
-                if 0x08021000 <= ret_addr <= 0x08022000:
-                    continue
-                _emu_log(f"[ASSERT_LOOP_BREAK] Found valid return at SP+{offset}: 0x{ret_addr:08x}\n")
-                uc.reg_write(UC_ARM_REG_PC, ret_addr | 1)
-                uc.reg_write(UC_ARM_REG_R0, 0)
-                return False
-    except:
-        pass
-
-    # Fallback: just exit cleanly
-    EXIT_LOOP_ADDR = 0x20018100
-    try:
-        uc.mem_write(EXIT_LOOP_ADDR, b'\xfe\xe7')
-        uc.reg_write(UC_ARM_REG_PC, EXIT_LOOP_ADDR | 1)
-    except:
-        pass
-    return False
+    # Exit immediately on any assert - system is broken
+    # Use PC=0 to trigger clean exit
+    uc.reg_write(UC_ARM_REG_PC, 0)
+    return True
 
 
 def trace_vStartFirstTask(uc):
