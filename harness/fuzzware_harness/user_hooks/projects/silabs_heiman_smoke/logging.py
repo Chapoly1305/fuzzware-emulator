@@ -42,6 +42,12 @@ def _emu_log(msg):
     _emulator_log_file.write(msg)
     _emulator_log_file.flush()
 
+    # Also write UART_TX to stderr for console capture
+    if '[UART_TX]' in msg:
+        import sys
+        sys.stderr.write(msg)
+        sys.stderr.flush()
+
 
 def _emu_debug_log(msg):
     """Write debug message to emulator.log (only if DEBUG_MODE). Adds newline if missing."""

@@ -499,22 +499,32 @@ def fuzz_cmd_0x41(uc):
     try:
         uc_handle = uc._uch
 
-        # Get fuzz input - up to 16 bytes
-        remaining = native.fuzz_remaining()
-        bytes_to_get = min(remaining, 16) if remaining > 0 else 0
+        # Trigger input loading by requesting 1 byte first (same pattern as start_uart_fuzzing)
+        ptr_addr = native.native_lib.get_fuzz_ptr(uc_handle, 1)
 
-        if bytes_to_get == 0:
+        # Now check how much fuzz is available
+        remaining = native.fuzz_remaining()
+        _emu_log(f"[FUZZ_CMD41] After trigger: remaining={remaining}\n")
+
+        if ptr_addr is None or ptr_addr == 0:
             _emu_log("[FUZZ_CMD41] No fuzz input available - exiting\n")
             native.do_exit(uc, 0)
             return True
 
-        ptr_addr = native.native_lib.get_fuzz_ptr(uc_handle, bytes_to_get)
-        if ptr_addr is None or ptr_addr == 0:
-            _emu_log("[FUZZ_CMD41] Failed to get fuzz pointer - exiting\n")
-            native.do_exit(uc, 0)
-            return True
+        # Read the first byte that was loaded
+        first_byte = (ctypes.c_char * 1).from_address(ptr_addr).raw
 
-        fuzz_data = (ctypes.c_char * bytes_to_get).from_address(ptr_addr).raw
+        # Get remaining bytes (up to 15 more for total of 16)
+        bytes_to_get = min(remaining, 15)
+        if bytes_to_get > 0:
+            ptr_addr2 = native.native_lib.get_fuzz_ptr(uc_handle, bytes_to_get)
+            if ptr_addr2 and ptr_addr2 != 0:
+                rest_bytes = (ctypes.c_char * bytes_to_get).from_address(ptr_addr2).raw
+                fuzz_data = first_byte + rest_bytes
+            else:
+                fuzz_data = first_byte
+        else:
+            fuzz_data = first_byte
 
         _emu_log(f"[FUZZ_CMD41] Got {len(fuzz_data)} bytes: {fuzz_data.hex()}\n")
         _log_input(fuzz_data)

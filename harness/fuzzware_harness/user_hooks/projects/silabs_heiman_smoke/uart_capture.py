@@ -149,11 +149,9 @@ def UARTDRV_ForceTransmit_hook(uc):
     if buffer_ptr != 0 and length > 0 and length < 512:
         try:
             data = uc.mem_read(buffer_ptr, length)
+            # Single UART_TX log for console capture
             _emu_log(f"[UART_TX] {data.hex()}\n")
-            _log_uart_packet("TX", data, "Response from firmware via ForceTransmit")
             increment_tx_count()
-
-            _emu_debug_log(f"[UART_TX] {data.hex()}")
         except Exception as e:
             _emu_log(f"[UARTDRV_ForceTransmit] Error reading buffer: {e}\n")
 
