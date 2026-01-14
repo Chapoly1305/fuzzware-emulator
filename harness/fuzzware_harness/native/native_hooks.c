@@ -68,6 +68,7 @@ uc_err mem_errors[] = {
 int do_print_exit_info = 0;
 
 uc_hook invalid_mem_hook_handle = 0;
+uc_hook invalid_insn_hook_handle = 0;
 uc_hook hook_block_cond_py_handlers_handle;
 uc_cb_hookcode_t py_hle_handler_hook = (uc_cb_hookcode_t)0;
 int num_handlers = 0;
@@ -91,6 +92,27 @@ uint32_t do_fuzz = 0;
 uint32_t persistent_no_reset = 0;
 
 uint64_t instr_limit = 0;
+
+static const int sysreg_gpr_ids[] = {
+    UC_ARM_REG_R0, UC_ARM_REG_R1, UC_ARM_REG_R2, UC_ARM_REG_R3,
+    UC_ARM_REG_R4, UC_ARM_REG_R5, UC_ARM_REG_R6, UC_ARM_REG_R7,
+    UC_ARM_REG_R8, UC_ARM_REG_R9, UC_ARM_REG_R10, UC_ARM_REG_R11,
+    UC_ARM_REG_R12,
+};
+
+static const int gpr_ids_full[] = {
+    UC_ARM_REG_R0, UC_ARM_REG_R1, UC_ARM_REG_R2, UC_ARM_REG_R3,
+    UC_ARM_REG_R4, UC_ARM_REG_R5, UC_ARM_REG_R6, UC_ARM_REG_R7,
+    UC_ARM_REG_R8, UC_ARM_REG_R9, UC_ARM_REG_R10, UC_ARM_REG_R11,
+    UC_ARM_REG_R12, UC_ARM_REG_SP, UC_ARM_REG_LR, UC_ARM_REG_PC,
+};
+
+static struct {
+    uint32_t primask;
+    uint32_t basepri;
+    uint32_t faultmask;
+    uint32_t control;
+} sysreg_shadow = {0};
 
 // 2. Transient variables (not required to be included in state restore)
 // Housekeeping information for tracing MMIO accesses
@@ -208,6 +230,302 @@ bool hook_debug_mem_invalid_access(uc_engine *uc, uc_mem_type type,
         printf("        >>> [ 0x%08lx ] INVALID FETCH: addr= 0x%016lx\n", pc, address);
     }
     fflush(stdout);
+    return false;
+}
+
+static uint32_t read_sysreg(uc_engine *uc, int reg_id, uint32_t *shadow) {
+    uint32_t val = 0;
+    if (uc_reg_read(uc, reg_id, &val) != UC_ERR_OK) {
+        return *shadow;
+    }
+    *shadow = val;
+    return val;
+}
+
+static void write_sysreg(uc_engine *uc, int reg_id, uint32_t value, uint32_t *shadow) {
+    *shadow = value;
+    uc_reg_write(uc, reg_id, &value);
+}
+
+static bool eval_cond(uint8_t cond, uint32_t xpsr) {
+    uint8_t n = (xpsr >> 31) & 1;
+    uint8_t z = (xpsr >> 30) & 1;
+    uint8_t c = (xpsr >> 29) & 1;
+    uint8_t v = (xpsr >> 28) & 1;
+
+    switch (cond) {
+        case 0x0: return z == 1;
+        case 0x1: return z == 0;
+        case 0x2: return c == 1;
+        case 0x3: return c == 0;
+        case 0x4: return n == 1;
+        case 0x5: return n == 0;
+        case 0x6: return v == 1;
+        case 0x7: return v == 0;
+        case 0x8: return c == 1 && z == 0;
+        case 0x9: return c == 0 || z == 1;
+        case 0xA: return n == v;
+        case 0xB: return n != v;
+        case 0xC: return z == 0 && n == v;
+        case 0xD: return z == 1 || n != v;
+        case 0xE: return true;
+        default: return false;
+    }
+}
+
+static uint32_t set_xpsr_nz(uint32_t xpsr, uint32_t result) {
+    if (result & 0x80000000u) {
+        xpsr |= (1u << 31);
+    } else {
+        xpsr &= ~(1u << 31);
+    }
+
+    if (result == 0) {
+        xpsr |= (1u << 30);
+    } else {
+        xpsr &= ~(1u << 30);
+    }
+
+    return xpsr;
+}
+
+static uint32_t set_xpsr_nzcv(uint32_t xpsr, uint32_t result, bool c, bool v) {
+    xpsr = set_xpsr_nz(xpsr, result);
+    if (c) {
+        xpsr |= (1u << 29);
+    } else {
+        xpsr &= ~(1u << 29);
+    }
+    if (v) {
+        xpsr |= (1u << 28);
+    } else {
+        xpsr &= ~(1u << 28);
+    }
+    return xpsr;
+}
+
+static bool hook_invalid_insn(uc_engine *uc, void *user_data) {
+    (void)user_data;
+    uint32_t pc = 0;
+    if (uc_reg_read(uc, UC_ARM_REG_PC, &pc) != UC_ERR_OK) {
+        return false;
+    }
+    uint32_t insn_pc = pc & ~1u;
+    uint8_t raw[4] = {0};
+    if (uc_mem_read(uc, insn_pc, raw, sizeof(raw)) != UC_ERR_OK) {
+        return false;
+    }
+
+    uint16_t h1 = (uint16_t)(raw[0] | (raw[1] << 8));
+    uint16_t h2 = (uint16_t)(raw[2] | (raw[3] << 8));
+    uint32_t xpsr = 0;
+    uc_reg_read(uc, UC_ARM_REG_XPSR, &xpsr);
+
+    if ((xpsr & (1u << 24)) == 0) {
+        xpsr |= (1u << 24);
+        uc_reg_write(uc, UC_ARM_REG_XPSR, &xpsr);
+        uint32_t next_pc = insn_pc | 1u;
+        uc_reg_write(uc, UC_ARM_REG_PC, &next_pc);
+        return true;
+    }
+
+    if (xpsr & ((0x3u << 25) | (0x3fu << 10))) {
+        xpsr &= ~((0x3u << 25) | (0x3fu << 10));
+        uc_reg_write(uc, UC_ARM_REG_XPSR, &xpsr);
+        uint32_t next_pc = insn_pc | 1u;
+        uc_reg_write(uc, UC_ARM_REG_PC, &next_pc);
+        return true;
+    }
+
+    if ((h1 & 0xF800) == 0x2000) {
+        uint8_t rd = (h1 >> 8) & 0x7;
+        uint32_t val = h1 & 0xFF;
+        uc_reg_write(uc, gpr_ids_full[rd], &val);
+        xpsr = set_xpsr_nz(xpsr, val);
+        uc_reg_write(uc, UC_ARM_REG_XPSR, &xpsr);
+        uint32_t next_pc = insn_pc + 2;
+        uc_reg_write(uc, UC_ARM_REG_PC, &next_pc);
+        return true;
+    }
+
+    if ((h1 & 0xFC00) == 0x4400) {
+        uint8_t op = (h1 >> 8) & 0x3;
+        if (op == 0x2) {
+            uint8_t rd = (h1 & 0x7) | ((h1 >> 4) & 0x8);
+            uint8_t rm = (h1 >> 3) & 0xF;
+            if (rd < (sizeof(gpr_ids_full) / sizeof(gpr_ids_full[0])) &&
+                rm < (sizeof(gpr_ids_full) / sizeof(gpr_ids_full[0])) &&
+                rd != 0xF && rm != 0xF) {
+                uint32_t val = 0;
+                uc_reg_read(uc, gpr_ids_full[rm], &val);
+                uc_reg_write(uc, gpr_ids_full[rd], &val);
+                uint32_t next_pc = insn_pc + 2;
+                uc_reg_write(uc, UC_ARM_REG_PC, &next_pc);
+                return true;
+            }
+        }
+    }
+
+    if ((h1 & 0xF800) == 0x3000) {
+        uint8_t rd = (h1 >> 8) & 0x7;
+        uint32_t imm8 = h1 & 0xFF;
+        uint32_t orig = 0;
+        uc_reg_read(uc, gpr_ids_full[rd], &orig);
+        uint32_t result = orig + imm8;
+        bool c = result < orig;
+        bool v = (~(orig ^ imm8) & (orig ^ result) & 0x80000000u) != 0;
+        uc_reg_write(uc, gpr_ids_full[rd], &result);
+        xpsr = set_xpsr_nzcv(xpsr, result, c, v);
+        uc_reg_write(uc, UC_ARM_REG_XPSR, &xpsr);
+        uint32_t next_pc = insn_pc + 2;
+        uc_reg_write(uc, UC_ARM_REG_PC, &next_pc);
+        return true;
+    }
+
+    if ((h1 & 0xF800) == 0x3800) {
+        uint8_t rd = (h1 >> 8) & 0x7;
+        uint32_t imm8 = h1 & 0xFF;
+        uint32_t orig = 0;
+        uc_reg_read(uc, gpr_ids_full[rd], &orig);
+        uint32_t result = orig - imm8;
+        bool c = orig >= imm8;
+        bool v = ((orig ^ imm8) & (orig ^ result) & 0x80000000u) != 0;
+        uc_reg_write(uc, gpr_ids_full[rd], &result);
+        xpsr = set_xpsr_nzcv(xpsr, result, c, v);
+        uc_reg_write(uc, UC_ARM_REG_XPSR, &xpsr);
+        uint32_t next_pc = insn_pc + 2;
+        uc_reg_write(uc, UC_ARM_REG_PC, &next_pc);
+        return true;
+    }
+
+    if ((h1 & 0xF800) == 0x2800) {
+        uint8_t rd = (h1 >> 8) & 0x7;
+        uint32_t imm8 = h1 & 0xFF;
+        uint32_t orig = 0;
+        uc_reg_read(uc, gpr_ids_full[rd], &orig);
+        uint32_t result = orig - imm8;
+        bool c = orig >= imm8;
+        bool v = ((orig ^ imm8) & (orig ^ result) & 0x80000000u) != 0;
+        xpsr = set_xpsr_nzcv(xpsr, result, c, v);
+        uc_reg_write(uc, UC_ARM_REG_XPSR, &xpsr);
+        uint32_t next_pc = insn_pc + 2;
+        uc_reg_write(uc, UC_ARM_REG_PC, &next_pc);
+        return true;
+    }
+
+    if (h1 == 0xF3EF) {
+        uint8_t rd = (h2 >> 8) & 0xF;
+        uint8_t sysm = h2 & 0xFF;
+        if (rd < (sizeof(sysreg_gpr_ids) / sizeof(sysreg_gpr_ids[0]))) {
+            uint32_t val = 0;
+            switch (sysm) {
+                case 0x10:
+                    val = read_sysreg(uc, UC_ARM_REG_PRIMASK, &sysreg_shadow.primask);
+                    break;
+                case 0x11:
+                    val = read_sysreg(uc, UC_ARM_REG_BASEPRI, &sysreg_shadow.basepri);
+                    break;
+                case 0x12:
+                    val = read_sysreg(uc, UC_ARM_REG_BASEPRI, &sysreg_shadow.basepri);
+                    break;
+                case 0x13:
+                    val = read_sysreg(uc, UC_ARM_REG_FAULTMASK, &sysreg_shadow.faultmask);
+                    break;
+                case 0x14:
+                    val = read_sysreg(uc, UC_ARM_REG_CONTROL, &sysreg_shadow.control) & 0x3;
+                    break;
+                default:
+                    val = 0;
+                    break;
+            }
+            uc_reg_write(uc, sysreg_gpr_ids[rd], &val);
+            uint32_t next_pc = insn_pc + 4;
+            uc_reg_write(uc, UC_ARM_REG_PC, &next_pc);
+            return true;
+        }
+    }
+
+    if ((h1 & 0xFFF0) == 0xF380) {
+        uint8_t rn = h1 & 0xF;
+        uint8_t sysm = h2 & 0xFF;
+        if (rn < (sizeof(sysreg_gpr_ids) / sizeof(sysreg_gpr_ids[0]))) {
+            uint32_t val = 0;
+            uc_reg_read(uc, sysreg_gpr_ids[rn], &val);
+            val &= 0xffffffffu;
+            switch (sysm) {
+                case 0x10:
+                    write_sysreg(uc, UC_ARM_REG_PRIMASK, val, &sysreg_shadow.primask);
+                    break;
+                case 0x11:
+                    write_sysreg(uc, UC_ARM_REG_BASEPRI, val, &sysreg_shadow.basepri);
+                    break;
+                case 0x12: {
+                    uint32_t curr = read_sysreg(uc, UC_ARM_REG_BASEPRI, &sysreg_shadow.basepri);
+                    uint32_t next = curr;
+                    if (val != 0 && (curr == 0 || val > curr)) {
+                        next = val;
+                    }
+                    write_sysreg(uc, UC_ARM_REG_BASEPRI, next, &sysreg_shadow.basepri);
+                    break;
+                }
+                case 0x13:
+                    write_sysreg(uc, UC_ARM_REG_FAULTMASK, val, &sysreg_shadow.faultmask);
+                    break;
+                case 0x14:
+                    val &= 0x3;
+                    write_sysreg(uc, UC_ARM_REG_CONTROL, val, &sysreg_shadow.control);
+                    break;
+                default:
+                    break;
+            }
+            uint32_t next_pc = insn_pc + 4;
+            uc_reg_write(uc, UC_ARM_REG_PC, &next_pc);
+            return true;
+        }
+    }
+
+    if ((h1 & 0xF000) == 0xD000 && (h1 & 0x0F00) != 0x0F00) {
+        uint8_t cond = (h1 >> 8) & 0xF;
+        int8_t imm8 = (int8_t)(h1 & 0xFF);
+        bool taken = eval_cond(cond, xpsr);
+        uint32_t next_pc = insn_pc + 2;
+        if (taken) {
+            next_pc = insn_pc + 4 + ((int32_t)imm8 << 1);
+        }
+        uc_reg_write(uc, UC_ARM_REG_PC, &next_pc);
+        return true;
+    }
+
+    if (h1 == 0xF3BF &&
+        (h2 == 0x8F4F || h2 == 0x8F5F || h2 == 0x8F6F)) {
+        uint32_t next_pc = insn_pc + 4;
+        uc_reg_write(uc, UC_ARM_REG_PC, &next_pc);
+        return true;
+    }
+
+    if (h1 == 0xB662) {
+        write_sysreg(uc, UC_ARM_REG_PRIMASK, 0, &sysreg_shadow.primask);
+        uint32_t next_pc = insn_pc + 2;
+        uc_reg_write(uc, UC_ARM_REG_PC, &next_pc);
+        return true;
+    }
+
+    if (h1 == 0xB672) {
+        write_sysreg(uc, UC_ARM_REG_PRIMASK, 1, &sysreg_shadow.primask);
+        uint32_t next_pc = insn_pc + 2;
+        uc_reg_write(uc, UC_ARM_REG_PC, &next_pc);
+        return true;
+    }
+
+    if (do_print_exit_info) {
+        uint32_t lr = 0;
+        uc_reg_read(uc, UC_ARM_REG_LR, &lr);
+        printf("[invalid-insn] pc=0x%08x raw=%02x%02x %02x%02x\n",
+               insn_pc, raw[1], raw[0], raw[3], raw[2]);
+        printf("[invalid-insn] lr=0x%08x xpsr=0x%08x\n", lr, xpsr);
+        fflush(stdout);
+    }
+
     return false;
 }
 
@@ -957,6 +1275,10 @@ uc_err init(uc_engine *uc, exit_hook_t p_exit_hook, int p_num_mmio_regions, uint
     if(do_print_exit_info) {
         uc_hook_add(uc, &invalid_mem_hook_handle, UC_HOOK_MEM_WRITE_INVALID | UC_HOOK_MEM_READ_INVALID | UC_HOOK_MEM_FETCH_INVALID, hook_debug_mem_invalid_access, 0, 1, 0);
     }
+    if (uc_hook_add(uc, &invalid_insn_hook_handle, UC_HOOK_INSN_INVALID, hook_invalid_insn, 0, 1, 0) != UC_ERR_OK) {
+        perror("Could not register invalid instruction hook...\n");
+        return -1;
+    }
 
     // Add fuzz consumption timeout as timer
     fuzz_consumption_timeout = p_fuzz_consumption_timeout;
@@ -1212,6 +1534,9 @@ uc_err emulate(uc_engine *uc, char *p_input_path, char *prefix_input_path) {
 
         // We do not expect to get here. The child should exit by itself in get_fuzz
         printf("[ERROR] Emulation stopped using just the prefix input (%d: %s)\n", child_emu_status, uc_strerror(child_emu_status));
+        if (do_print_exit_info) {
+            print_state(uc);
+        }
 
         // Write wrong amount of data to notify parent of failure
         if(write(pipe_to_parent[1], emulate, 1) != 1) {

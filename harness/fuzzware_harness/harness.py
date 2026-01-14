@@ -4,8 +4,29 @@ import os
 import sys
 import logging
 
-from unicorn import (UC_ARCH_ARM, UC_MODE_MCLASS, UC_MODE_THUMB, Uc)
-from unicorn.arm_const import UC_ARM_REG_PC, UC_ARM_REG_SP
+from unicorn import (UC_ARCH_ARM, UC_MODE_MCLASS, UC_MODE_THUMB, UC_HOOK_INSN_INVALID, Uc, UcError)
+from unicorn.arm_const import (
+    UC_ARM_REG_BASEPRI,
+    UC_ARM_REG_CONTROL,
+    UC_ARM_REG_FAULTMASK,
+    UC_ARM_REG_PC,
+    UC_ARM_REG_PRIMASK,
+    UC_ARM_REG_R0,
+    UC_ARM_REG_R1,
+    UC_ARM_REG_R2,
+    UC_ARM_REG_R3,
+    UC_ARM_REG_R4,
+    UC_ARM_REG_R5,
+    UC_ARM_REG_R6,
+    UC_ARM_REG_R7,
+    UC_ARM_REG_R8,
+    UC_ARM_REG_R9,
+    UC_ARM_REG_R10,
+    UC_ARM_REG_R11,
+    UC_ARM_REG_R12,
+    UC_ARM_REG_SP,
+    UC_ARM_REG_XPSR,
+)
 
 from . import globs, interrupt_triggers, native, timer, user_hooks
 from .gdbserver import GDBServer
@@ -29,7 +50,145 @@ def unicorn_trace_syms(uc, pc, size=0, user_data=None):
         if lr_sym:
             print(f" from {lr_sym}", flush=False, end="")
         print(f" (PC={hex(pc)}, LR={hex(lr)})", flush=True)
-        sys.stdout.flush()
+    sys.stdout.flush()
+
+_GPR_IDS = (
+    UC_ARM_REG_R0, UC_ARM_REG_R1, UC_ARM_REG_R2, UC_ARM_REG_R3,
+    UC_ARM_REG_R4, UC_ARM_REG_R5, UC_ARM_REG_R6, UC_ARM_REG_R7,
+    UC_ARM_REG_R8, UC_ARM_REG_R9, UC_ARM_REG_R10, UC_ARM_REG_R11,
+    UC_ARM_REG_R12,
+)
+
+_SYSREG_IDS = {
+    0x10: ("PRIMASK", UC_ARM_REG_PRIMASK),
+    0x11: ("BASEPRI", UC_ARM_REG_BASEPRI),
+    0x12: ("BASEPRI_MAX", UC_ARM_REG_BASEPRI),
+    0x13: ("FAULTMASK", UC_ARM_REG_FAULTMASK),
+    0x14: ("CONTROL", UC_ARM_REG_CONTROL),
+}
+
+def _eval_cond(cond, xpsr):
+    n = (xpsr >> 31) & 1
+    z = (xpsr >> 30) & 1
+    c = (xpsr >> 29) & 1
+    v = (xpsr >> 28) & 1
+    if cond == 0x0:
+        return z == 1
+    if cond == 0x1:
+        return z == 0
+    if cond == 0x2:
+        return c == 1
+    if cond == 0x3:
+        return c == 0
+    if cond == 0x4:
+        return n == 1
+    if cond == 0x5:
+        return n == 0
+    if cond == 0x6:
+        return v == 1
+    if cond == 0x7:
+        return v == 0
+    if cond == 0x8:
+        return c == 1 and z == 0
+    if cond == 0x9:
+        return c == 0 or z == 1
+    if cond == 0xA:
+        return n == v
+    if cond == 0xB:
+        return n != v
+    if cond == 0xC:
+        return z == 0 and n == v
+    if cond == 0xD:
+        return z == 1 or n != v
+    if cond == 0xE:
+        return True
+    return False
+
+def _install_sysreg_fallback_hook(uc):
+    sysreg_shadow = {
+        "PRIMASK": 0,
+        "BASEPRI": 0,
+        "FAULTMASK": 0,
+        "CONTROL": 0,
+    }
+
+    def _read_sysreg(name, reg_id):
+        try:
+            return uc.reg_read(reg_id)
+        except UcError:
+            return sysreg_shadow.get(name, 0)
+
+    def _write_sysreg(name, reg_id, value):
+        value &= 0xffffffff
+        if name == "CONTROL":
+            value &= 0x3
+        sysreg_shadow[name] = value
+        try:
+            uc.reg_write(reg_id, value)
+        except UcError:
+            pass
+
+    def _hook_sysreg_invalid(uc, user_data):
+        pc = uc.reg_read(UC_ARM_REG_PC) & ~1
+        try:
+            raw = uc.mem_read(pc, 4)
+        except UcError:
+            print(f"[SYSREG-FALLBACK] invalid insn at 0x{pc:08x}: <unreadable bytes>", flush=True)
+            return False
+
+        h1 = raw[0] | (raw[1] << 8)
+        h2 = raw[2] | (raw[3] << 8)
+
+        if h1 == 0xF3EF:
+            rd = (h2 >> 8) & 0xF
+            sysm = h2 & 0xFF
+            entry = _SYSREG_IDS.get(sysm)
+            if entry and rd < len(_GPR_IDS):
+                name, reg_id = entry
+                val = _read_sysreg(name, reg_id)
+                uc.reg_write(_GPR_IDS[rd], val)
+                uc.reg_write(UC_ARM_REG_PC, pc + 4)
+                return True
+
+        if (h1 & 0xFFF0) == 0xF380:
+            rn = h1 & 0xF
+            sysm = h2 & 0xFF
+            entry = _SYSREG_IDS.get(sysm)
+            if entry and rn < len(_GPR_IDS):
+                name, reg_id = entry
+                val = uc.reg_read(_GPR_IDS[rn])
+                if name == "BASEPRI_MAX":
+                    _write_sysreg("BASEPRI", reg_id, val)
+                else:
+                    _write_sysreg(name, reg_id, val)
+                uc.reg_write(UC_ARM_REG_PC, pc + 4)
+                return True
+
+        if 0xD000 <= h1 <= 0xDFFF and ((h1 >> 8) & 0xF) != 0xF:
+            cond = (h1 >> 8) & 0xF
+            imm8 = h1 & 0xFF
+            xpsr = uc.reg_read(UC_ARM_REG_XPSR)
+            taken = _eval_cond(cond, xpsr)
+            offset = ((imm8 ^ 0x80) - 0x80) << 1
+            next_pc = pc + 2
+            if taken:
+                next_pc = pc + 4 + offset
+            uc.reg_write(UC_ARM_REG_PC, next_pc)
+            return True
+
+        sym = ""
+        try:
+            syms = getattr(uc, "syms_by_addr", {})
+            sym = syms.get(pc, "")
+        except Exception:
+            sym = ""
+        if sym:
+            sym = f" ({sym})"
+        b0, b1, b2, b3 = raw
+        print(f"[SYSREG-FALLBACK] invalid insn at 0x{pc:08x}{sym}: {b1:02x}{b0:02x} {b3:02x}{b2:02x}", flush=True)
+        return False
+
+    uc.hook_add(UC_HOOK_INSN_INVALID, _hook_sysreg_invalid)
 
 def configure_unicorn(args):
     logger.info(f"Loading configuration in {str(args.config)}")
@@ -60,6 +219,8 @@ def configure_unicorn(args):
 
     # Create the unicorn
     uc = Uc(UC_ARCH_ARM, UC_MODE_THUMB | UC_MODE_MCLASS)
+    if os.environ.get("FUZZWARE_PY_SYSREG_FALLBACK") == "1":
+        _install_sysreg_fallback_hook(uc)
 
     uc.symbols, uc.syms_by_addr = parse_symbols(config)
 

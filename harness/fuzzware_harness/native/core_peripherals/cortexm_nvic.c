@@ -1007,6 +1007,10 @@ static void handler_svc(uc_engine *uc, uint32_t intno, void *user_data) {
     #ifdef DEBUG_NVIC
     printf("[SVC HOOK %08x] native SVC hook called, intno: %d\n", pc, intno); fflush(stdout);
     #endif
+    if (do_print_exit_info) {
+        printf("[SVC HOOK %08x] intno=%u\n", pc, intno);
+        fflush(stdout);
+    }
 
     // Handle EXCP_EXCEPTION_EXIT (Unicorn 2 M-profile exception return)
     // This happens when PC is in the magic return address range (0xffffff0x)
