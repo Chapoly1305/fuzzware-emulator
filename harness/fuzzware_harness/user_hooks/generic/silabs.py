@@ -20,6 +20,12 @@ EMULATOR_LOG = os.environ.get('EMULATOR_LOG', '/tmp/emulator.log')
 
 _firmware_log_file = None
 _emulator_log_file = None
+_sim_time_ms = 0
+
+
+def _get_timestamp():
+    """Return a simple simulated timestamp for log prefixes."""
+    return f"[{_sim_time_ms:08d}]"
 
 def _fw_log(msg):
     """Write to firmware.log (firmware output: println, RTT, UART)"""

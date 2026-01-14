@@ -88,7 +88,11 @@ def emulate(uc, fuzz_file_path, prefix_input_file_path=None):
     native_lib.emulate(uc._uch, fuzz_file_path.encode(), prefix_input_file_path)
 
 def get_fuzz(uc, size):
-    ptr = (ctypes.c_char * size).from_address(native_lib.get_fuzz_ptr(uc, size))
+    uc_handle = uc._uch if hasattr(uc, "_uch") else uc
+    ptr_addr = native_lib.get_fuzz_ptr(uc_handle, size)
+    if not ptr_addr:
+        return b""
+    ptr = (ctypes.c_char * size).from_address(ptr_addr)
     return ptr.raw
 
 def fuzz_consumed():
