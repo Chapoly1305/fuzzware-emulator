@@ -4,10 +4,11 @@ import glob
 import logging
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
-from setuptools import setup
+from setuptools import find_packages, setup
 from setuptools.command.build_py import build_py
 from setuptools.command.sdist import sdist
 
@@ -129,6 +130,27 @@ def build_libraries():
         shutil.copy(os.path.join(BUILD_DIR, STATIC_LIBRARY_FILE), LIBS_DIR)
 
 
+def load_version():
+    env_version = os.environ.get("SETUPTOOLS_SCM_PRETEND_VERSION")
+    if env_version:
+        return env_version
+
+    const_path = os.path.join(ROOT_DIR, "unicorn", "unicorn_const.py")
+    try:
+        with open(const_path, "r", encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return "0.0.0"
+
+    major = re.search(r"UC_VERSION_MAJOR\s*=\s*(\d+)", text)
+    minor = re.search(r"UC_VERSION_MINOR\s*=\s*(\d+)", text)
+    patch = re.search(r"UC_VERSION_PATCH\s*=\s*(\d+)", text)
+    if not (major and minor and patch):
+        return "0.0.0"
+
+    return f"{major.group(1)}.{minor.group(1)}.{patch.group(1)}"
+
+
 class CustomSDist(sdist):
     def run(self):
         clean_bins()
@@ -150,4 +172,10 @@ setup(
     cmdclass={'build_py': CustomBuild, 'sdist': CustomSDist},
     has_ext_modules=lambda: True,  # It's not a Pure Python wheel,
     options={"bdist_wheel": {"py_limited_api": "cp37"}},  # to have ABI3 tagged wheel
+    name="unicorn",
+    version=load_version(),
+    packages=find_packages(include=["unicorn*"]),
+    include_package_data=True,
+    install_requires=["importlib_resources; python_version < '3.9'"],
+    python_requires=">=2.7",
 )
