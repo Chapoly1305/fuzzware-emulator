@@ -12,6 +12,8 @@ import sys
 import os
 from unicorn.arm_const import UC_ARM_REG_R0, UC_ARM_REG_R1, UC_ARM_REG_R2, UC_ARM_REG_LR
 
+from ...fuzz import get_fuzz
+
 # ============================================================================
 # Provisioning Configuration for BRD2601B
 # ============================================================================
@@ -81,6 +83,29 @@ def _log_warn(msg):
 # ============================================================================
 # Matter Provision::Storage Hooks
 # ============================================================================
+
+_fuzz_consumed_once = False
+
+def consume_fuzz_once(uc):
+    global _fuzz_consumed_once
+    if not _fuzz_consumed_once:
+        get_fuzz(uc, 1)
+        _fuzz_consumed_once = True
+    uc.reg_write(UC_ARM_REG_R0, 0)
+
+def UARTDRV_Receive_fuzz(uc):
+    """
+    Ecode_t UARTDRV_Receive(UARTDRV_Handle_t handle, uint8_t *data, UARTDRV_Count_t count, ...)
+    R0 = handle, R1 = data buffer, R2 = count
+    """
+    buf_ptr = uc.reg_read(UC_ARM_REG_R1)
+    count = uc.reg_read(UC_ARM_REG_R2)
+    if buf_ptr != 0 and count:
+        fuzz_data = get_fuzz(uc, count) or b""
+        if len(fuzz_data) < count:
+            fuzz_data = fuzz_data.ljust(count, b"\0")
+        uc.mem_write(buf_ptr, fuzz_data[:count])
+    uc.reg_write(UC_ARM_REG_R0, 0)
 
 def ProvisionStorage_GetVendorId(uc):
     """
